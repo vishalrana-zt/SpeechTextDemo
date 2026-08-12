@@ -1,0 +1,544 @@
+//
+//  RecordScreen.swift
+//  Compact bottom panel for on-device recording + transcription.
+//
+
+import SwiftUI
+
+struct RecordScreen: View {
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private let manager = SpeechToTextManager.shared
+    private let autoStartOnAppear: Bool
+    private let onTranscriptReady: ((String) -> Void)?
+    private let onProcessingCompleted: (() -> Void)?
+    private let minimumRecordingDuration: TimeInterval = 0.45
+
+    @State private var isListening = false
+    @State private var isTranscribing = false
+    @State private var transcript = ""
+    @State private var detectedLanguage: SpeechToTextManager.SupportedLanguage?
+    @State private var errorMessage: String?
+    @State private var recordingStartedAt: Date?
+    @State private var lastRecordingDuration: TimeInterval = 0
+    @State private var micLevel: CGFloat = 0
+    @State private var hasAutoStartedRecording = false
+    @State private var isLiveTranscriptionEnabled = SpeechToTextManager.shared.isLiveTranscriptionEnabled
+    @State private var liveTranscriptionTask: Task<Void, Never>?
+    @State private var isLiveDecodeInFlight = false
+
+    init(
+        autoStartOnAppear: Bool = false,
+        onTranscriptReady: ((String) -> Void)? = nil,
+        onProcessingCompleted: (() -> Void)? = nil
+    ) {
+        self.autoStartOnAppear = autoStartOnAppear
+        self.onTranscriptReady = onTranscriptReady
+        self.onProcessingCompleted = onProcessingCompleted
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                MicStatusOrb(
+                    isListening: isListening,
+                    isTranscribing: isTranscribing,
+                    level: micLevel
+                )
+
+                if isListening, let recordingStartedAt {
+                    TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                        Text(formatDuration(seconds: Int(context.date.timeIntervalSince(recordingStartedAt))))
+                            .font(.title2.monospacedDigit().weight(.bold))
+                            .foregroundStyle(.red)
+                    }
+                } else if isTranscribing {
+                    HStack(spacing: 8) {
+                        Text("Transcribing...")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Text(formattedRecordingDuration)
+                            .font(.subheadline.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    idlePromptText
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.leading)
+                }
+
+                Spacer(minLength: 8)
+
+                Button(action: { Task { await toggleRecording() } }) {
+                    HStack(spacing: 6) {
+                        if isTranscribing {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(Color.accentColor)
+                                .scaleEffect(1.2)
+                                .frame(width: 20, height: 20)
+                        } else {
+                            Image(systemName: isListening ? "pause.fill" : "play.fill")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text(isListening ? "Stop" : "Speak now")
+                                .font(.subheadline.weight(.semibold))
+                        }
+                    }
+                    .foregroundColor(isTranscribing ? .secondary : .white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 9)
+                    .background(
+                        isTranscribing
+                            ? Color.accentColor.opacity(0.18)
+                            : (isListening ? Color.red : Color.accentColor),
+                        in: Capsule()
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(
+                                isTranscribing ? Color.accentColor.opacity(0.45) : Color.clear,
+                                lineWidth: 1
+                            )
+                    )
+                }
+                .allowsHitTesting(!isTranscribing)
+            }
+            .padding(.horizontal, 2)
+
+            Toggle("Live transcription", isOn: $isLiveTranscriptionEnabled)
+                .font(.caption.weight(.semibold))
+                .tint(.accentColor)
+                .onChange(of: isLiveTranscriptionEnabled) { _, isEnabled in
+                    manager.isLiveTranscriptionEnabled = isEnabled
+                    if isEnabled {
+                        startLiveTranscriptionIfNeeded()
+                    } else {
+                        stopLiveTranscription()
+                    }
+                }
+
+            if isListening || isTranscribing {
+                VStack(alignment: .leading, spacing: 6) {
+                    if isTranscribing, let languageStatusText {
+                        Text(languageStatusText)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let languageDetectionText {
+                        Text(languageDetectionText)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    ListeningWaveformView(
+                        isListening: isListening,
+                        isTranscribing: isTranscribing,
+                        level: micLevel
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+            }
+
+            if !transcript.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let detectedLanguage {
+                        Text(detectedLanguage.displayName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(transcript)
+                        .font(.footnote)
+                        .lineLimit(4)
+                        .multilineTextAlignment(.leading)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(panelFillColor)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: isTranscribing
+                                    ? [
+                                        Color.white.opacity(0.16),
+                                        Color.white.opacity(0.04)
+                                    ]
+                                    : [Color.clear, Color.clear],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(
+                            panelBorderColor,
+                            lineWidth: 1
+                        )
+                )
+        )
+        .shadow(color: panelShadowColor, radius: 14, y: 4)
+        .onAppear {
+            manager.onAudioLevelChange = { rmsLevel in
+                let amplified = pow(max(rmsLevel, 0) * 18.0, 0.62)
+                let target = CGFloat(max(0, min(1, amplified)))
+                // Smooth quick fluctuations so the panel feels stable but alive.
+                micLevel = (micLevel * 0.35) + (target * 0.65)
+            }
+            manager.onSilenceAutoStopTriggered = {
+                Task { await handleManagerAutoStop() }
+            }
+            isLiveTranscriptionEnabled = manager.isLiveTranscriptionEnabled
+
+            guard autoStartOnAppear, !hasAutoStartedRecording else { return }
+            hasAutoStartedRecording = true
+            Task { await toggleRecording() }
+        }
+        .onDisappear {
+            stopLiveTranscription()
+            manager.onAudioLevelChange = nil
+            manager.onSilenceAutoStopTriggered = nil
+            micLevel = 0
+        }
+    }
+
+    private var statusText: String {
+        if isTranscribing { return "Transcribing..." }
+        if isListening { return formattedRecordingDuration }
+        return "Tap Speak now to start recording"
+    }
+
+    private var idlePromptText: Text {
+        if isListening || isTranscribing {
+            return Text(statusText)
+        }
+        return Text("Tap \(Text("Speak now").foregroundStyle(Color.accentColor).fontWeight(.bold)) to start recording")
+    }
+
+    private var languageStatusText: String? {
+        guard let detectedLanguage else { return nil }
+        return "Detected \(detectedLanguage.displayName) audio"
+    }
+
+    private var languageDetectionText: String? {
+        if isTranscribing {
+            if let detectedLanguage {
+                return "Detected \(detectedLanguage.displayName) audio"
+            }
+            return nil
+        }
+
+        if !transcript.isEmpty, let detectedLanguage {
+            return "Detected \(detectedLanguage.displayName) audio"
+        }
+
+        return nil
+    }
+
+    private var formattedRecordingDuration: String {
+        formatDuration(seconds: Int(lastRecordingDuration))
+    }
+
+    private var panelFillColor: Color {
+        if colorScheme == .dark {
+            return Color(.secondarySystemBackground).opacity(0.92)
+        }
+        return Color(.systemBackground).opacity(0.97)
+    }
+
+    private var panelBorderColor: Color {
+        if colorScheme == .dark {
+            return Color.white.opacity(isTranscribing ? 0.18 : 0.12)
+        }
+        return Color.black.opacity(isTranscribing ? 0.14 : 0.09)
+    }
+
+    private var panelShadowColor: Color {
+        if colorScheme == .dark {
+            return Color.black.opacity(0.35)
+        }
+        return Color.black.opacity(0.14)
+    }
+
+    private func formatDuration(seconds: Int) -> String {
+        let safeSeconds = max(0, seconds)
+        let minutes = safeSeconds / 60
+        let remainingSeconds = safeSeconds % 60
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+
+    private func toggleRecording() async {
+        errorMessage = nil
+
+        guard await manager.gateFeatureUsage() else {
+            errorMessage = "Model is not ready yet."
+            return
+        }
+
+        if isListening {
+            stopLiveTranscription()
+            finalizeRecordingSession()
+            guard lastRecordingDuration >= minimumRecordingDuration else {
+                errorMessage = "Recording too short. Speak for a moment, then tap Stop."
+                return
+            }
+            await transcribeCurrentRecording()
+            return
+        }
+
+        let granted = await manager.requestMicPermission()
+        guard granted else {
+            errorMessage = "Microphone permission denied. Enable it in Settings."
+            return
+        }
+
+        do {
+            try manager.startListening(
+                autoStopOnSilence: false,
+                silenceDuration: 1.0,
+                silenceThreshold: 0.003
+            )
+            transcript = ""
+            detectedLanguage = nil
+            lastRecordingDuration = 0
+            recordingStartedAt = Date()
+            isListening = true
+            startLiveTranscriptionIfNeeded()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func finalizeRecordingSession() {
+        stopLiveTranscription()
+        if let recordingStartedAt {
+            lastRecordingDuration = max(0, Date().timeIntervalSince(recordingStartedAt))
+        }
+        recordingStartedAt = nil
+        isListening = false
+    }
+
+    private func transcribeCurrentRecording() async {
+        isListening = false
+        isTranscribing = true
+        defer { isTranscribing = false }
+
+        do {
+            let result = try await manager.transcribe()
+            transcript = result.text
+            detectedLanguage = result.language
+            if !result.text.isEmpty {
+                onTranscriptReady?(result.text)
+            }
+            onProcessingCompleted?()
+        } catch {
+            let message = error.localizedDescription
+            if message.localizedCaseInsensitiveContains("no audio was captured") {
+                errorMessage = "No speech detected. Try again and speak a bit louder."
+            } else {
+                errorMessage = message
+            }
+        }
+    }
+
+    private func handleManagerAutoStop() async {
+        guard isListening else { return }
+        finalizeRecordingSession()
+        guard lastRecordingDuration >= minimumRecordingDuration else {
+            errorMessage = "Recording too short. Speak for a moment, then tap Stop."
+            return
+        }
+        await transcribeCurrentRecording()
+    }
+
+    private func startLiveTranscriptionIfNeeded() {
+        guard isLiveTranscriptionEnabled, isListening, !isTranscribing, liveTranscriptionTask == nil else { return }
+
+        liveTranscriptionTask = Task {
+            while !Task.isCancelled {
+                let shouldContinue = await MainActor.run {
+                    isListening && isLiveTranscriptionEnabled && !isTranscribing
+                }
+                guard shouldContinue else { break }
+
+                let canDecode = await MainActor.run {
+                    if isLiveDecodeInFlight { return false }
+                    isLiveDecodeInFlight = true
+                    return true
+                }
+
+                if canDecode {
+                    defer {
+                        Task { @MainActor in
+                            isLiveDecodeInFlight = false
+                        }
+                    }
+
+                    do {
+                        let preferredLanguage = await MainActor.run { detectedLanguage }
+                        if let partial = try await manager.transcribePartialCurrentBuffer(
+                            preferredLanguage: preferredLanguage,
+                            maxAudioSeconds: 8.0,
+                            minimumAudioSeconds: 0.8
+                        ) {
+                            await MainActor.run {
+                                transcript = partial.text
+                                detectedLanguage = partial.language
+                            }
+                        }
+                    } catch {
+                        // Ignore intermittent live decode errors; final decode still runs on stop.
+                    }
+                }
+
+                try? await Task.sleep(nanoseconds: 900_000_000)
+            }
+
+            await MainActor.run {
+                liveTranscriptionTask = nil
+                isLiveDecodeInFlight = false
+            }
+        }
+    }
+
+    private func stopLiveTranscription() {
+        liveTranscriptionTask?.cancel()
+        liveTranscriptionTask = nil
+        isLiveDecodeInFlight = false
+    }
+}
+
+private struct MicStatusOrb: View {
+    let isListening: Bool
+    let isTranscribing: Bool
+    let level: CGFloat
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+            let clampedLevel = max(0, min(1, level))
+            let energy = pow(clampedLevel, 0.7)
+            let speakingActive = isListening && clampedLevel > 0.08
+            let time = context.date.timeIntervalSinceReferenceDate
+            let cycle = 1.35
+            let reactiveBoost = speakingActive ? (0.22 + (energy * 0.8)) : 0
+            let coreColor: Color = isListening ? .red : Color(.tertiarySystemFill)
+            let iconColor: Color = isListening ? .white : .secondary
+            let coreSize: CGFloat = isListening ? 25 : 40
+            let orbSize: CGFloat = isListening ? 50 : 52
+            let baseRingSize: CGFloat = coreSize + 2
+
+            ZStack {
+                if speakingActive {
+                    ForEach(0..<3, id: \.self) { index in
+                        let shifted = (time + (Double(index) * (cycle / 3.0))).truncatingRemainder(dividingBy: cycle)
+                        let progress = shifted / cycle
+                        let scale = 1.0 + (progress * (0.65 + (reactiveBoost * 0.35)))
+                        let alpha = max(0, (1.0 - progress)) * (0.34 - (Double(index) * 0.08))
+
+                        Circle()
+                            .stroke(Color.red.opacity(alpha), lineWidth: 1.6 - (CGFloat(index) * 0.25))
+                            .frame(width: baseRingSize, height: baseRingSize)
+                            .scaleEffect(scale)
+                            .blur(radius: 0.1 + (CGFloat(index) * 0.18))
+                    }
+                }
+
+                if isListening {
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                colors: [
+                                    Color.red.opacity(0.26),
+                                    Color.red.opacity(0.08),
+                                    Color.clear
+                                ],
+                                center: .center,
+                                startRadius: 2,
+                                endRadius: 24
+                            )
+                        )
+                        .frame(width: coreSize + 18, height: coreSize + 18)
+                }
+
+                Circle()
+                    .fill(coreColor)
+                    .frame(width: coreSize, height: coreSize)
+
+                Image(systemName: isTranscribing ? "waveform" : "mic.fill")
+                    .font(.system(size: isListening ? 14 : 17, weight: .bold))
+                    .foregroundStyle(iconColor)
+            }
+            .frame(width: orbSize, height: orbSize)
+        }
+        .frame(width: isListening ? 46 : 52, height: isListening ? 46 : 52)
+    }
+}
+
+private struct ListeningWaveformView: View {
+    let isListening: Bool
+    let isTranscribing: Bool
+    let level: CGFloat
+
+    var body: some View {
+        GeometryReader { proxy in
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+                let width = max(proxy.size.width, 1)
+                let barWidth: CGFloat = 3.5
+                let spacing: CGFloat = 2.5
+                let barCount = max(Int((width + spacing) / (barWidth + spacing)), 16)
+
+                let time = context.date.timeIntervalSinceReferenceDate
+                let activeLevel = max(0, min(1, level))
+                let speakingLevel = max(0, (activeLevel - 0.08) / 0.92)
+                HStack(alignment: .center, spacing: spacing) {
+                    ForEach(0..<barCount, id: \.self) { index in
+                        let phase = time * 7 + Double(index) * 0.65
+                        let pulse = (sin(phase) + 1) * 0.5
+                        let envelope = (sin((Double(index) * 0.9) + (time * 2.2)) + 1) * 0.5
+                        let speakingBase = 0.72 + (pulse * 0.62) + (envelope * 0.38)
+                let speakingBoost = isListening ? Double(speakingLevel) * speakingBase : 0
+                let processingBoost = isTranscribing ? (0.18 + 0.2 * pulse) : 0
+                let boost = speakingBoost + processingBoost
+                let barHeight = min(24, 6 + (boost * 16))
+                let neutralOpacity = isTranscribing ? (0.25 + (0.2 * pulse)) : 0.3
+                let barColor = isListening
+                    ? Color.red
+                    : (isTranscribing
+                        ? Color.secondary.opacity(0.22 + (0.14 * pulse))
+                        : Color.secondary.opacity(neutralOpacity))
+
+                        Capsule()
+                            .fill(barColor)
+                            .frame(width: barWidth, height: barHeight)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 30)
+                .clipped()
+            }
+        }
+        .frame(height: 30)
+    }
+}
+
+#Preview {
+    RecordScreen()
+}
