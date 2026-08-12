@@ -8,6 +8,7 @@
 
 import Foundation
 import AVFoundation
+import CoreML
 import WhisperKit
 
 final class SpeechToTextManager: NSObject {
@@ -58,7 +59,7 @@ final class SpeechToTextManager: NSObject {
     enum ModelState: Equatable {
         case notDownloaded
         case downloading(DownloadStatus)
-        case loadingModel
+        case loadingModel(loaded: Int, total: Int)
         case ready
         case failed(String)
     }
@@ -81,6 +82,7 @@ final class SpeechToTextManager: NSObject {
     private var sampleBuffer: [Float] = []
     private let targetSampleRate: Double = 16_000
     private let bufferLock = NSLock()
+    private var hasInputTapInstalled = false
 
     private var autoStopOnSilence = false
     private var requiredSilenceDuration: TimeInterval = 1.0
@@ -162,7 +164,7 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
-    private static let modelSource: ModelSource = .cdn
+    private static let modelSource: ModelSource = .bundled
     private let cdnDownloader = CDNModelDownloader()
 
     var isBundledModelSource: Bool {
@@ -207,9 +209,10 @@ final class SpeechToTextManager: NSObject {
                 return
             }
 
-            modelState = .loadingModel
-            liveWhisperKit = try await WhisperKit(modelFolder: tinyModelFolder.path)
-            finalWhisperKit = try await WhisperKit(modelFolder: smallModelFolder.path)
+            modelState = .loadingModel(loaded: 0, total: 2)
+            liveWhisperKit = try await createWhisperKit(modelFolder: tinyModelFolder.path)
+            modelState = .loadingModel(loaded: 1, total: 2)
+            finalWhisperKit = try await createWhisperKit(modelFolder: smallModelFolder.path)
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
             modelState = .ready
         } catch is CancellationError {
@@ -230,11 +233,12 @@ final class SpeechToTextManager: NSObject {
         }
 
         do {
-            modelState = .loadingModel
+            modelState = .loadingModel(loaded: 0, total: 2)
             let tinyModelFolder = try prepareBundledModelFolder(for: .tiny, sourceFolder: tinySourceFolder)
             let smallModelFolder = try prepareBundledModelFolder(for: .small, sourceFolder: smallSourceFolder)
-            liveWhisperKit = try await WhisperKit(modelFolder: tinyModelFolder.path)
-            finalWhisperKit = try await WhisperKit(modelFolder: smallModelFolder.path)
+            liveWhisperKit = try await createWhisperKit(modelFolder: tinyModelFolder.path)
+            modelState = .loadingModel(loaded: 1, total: 2)
+            finalWhisperKit = try await createWhisperKit(modelFolder: smallModelFolder.path)
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
             modelState = .ready
         } catch {
@@ -292,18 +296,24 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func bundledModelURL(for variant: ModelVariant) -> URL? {
-        let candidates: [URL?] = [
-            Bundle.main.url(forResource: variant.modelName, withExtension: nil),
-            Bundle.main.url(forResource: variant.modelName, withExtension: "bundle"),
-            Bundle.main.url(forResource: variant.modelName, withExtension: nil, subdirectory: "Resource"),
-            Bundle.main.url(forResource: variant.modelName, withExtension: "bundle", subdirectory: "Resource"),
-            Bundle.main.resourceURL?.appendingPathComponent(variant.modelName, isDirectory: true),
-            Bundle.main.resourceURL?.appendingPathComponent("\(variant.modelName).bundle", isDirectory: true),
-            Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
-                .appendingPathComponent(variant.modelName, isDirectory: true),
-            Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
-                .appendingPathComponent("\(variant.modelName).bundle", isDirectory: true)
-        ]
+        let alternateModelName = variant.modelName.replacingOccurrences(of: "-", with: "_")
+        let modelNames = Array(Set([variant.modelName, alternateModelName]))
+        var candidates: [URL?] = []
+
+        for name in modelNames {
+            candidates.append(contentsOf: [
+                Bundle.main.url(forResource: name, withExtension: nil),
+                Bundle.main.url(forResource: name, withExtension: "bundle"),
+                Bundle.main.url(forResource: name, withExtension: nil, subdirectory: "Resource"),
+                Bundle.main.url(forResource: name, withExtension: "bundle", subdirectory: "Resource"),
+                Bundle.main.resourceURL?.appendingPathComponent(name, isDirectory: true),
+                Bundle.main.resourceURL?.appendingPathComponent("\(name).bundle", isDirectory: true),
+                Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
+                    .appendingPathComponent(name, isDirectory: true),
+                Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
+                    .appendingPathComponent("\(name).bundle", isDirectory: true)
+            ])
+        }
 
         for candidate in candidates.compactMap({ $0 }) where isBundledModelFolder(candidate, variant: variant) {
             return candidate
@@ -380,9 +390,10 @@ final class SpeechToTextManager: NSObject {
         }
 
         do {
-            modelState = .loadingModel
-            liveWhisperKit = try await WhisperKit(modelFolder: tinyModelFolder.path)
-            finalWhisperKit = try await WhisperKit(modelFolder: smallModelFolder.path)
+            modelState = .loadingModel(loaded: 0, total: 2)
+            liveWhisperKit = try await createWhisperKit(modelFolder: tinyModelFolder.path)
+            modelState = .loadingModel(loaded: 1, total: 2)
+            finalWhisperKit = try await createWhisperKit(modelFolder: smallModelFolder.path)
             modelState = .ready
             return true
         } catch {
@@ -448,6 +459,19 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
+    private func createWhisperKit(modelFolder: String) async throws -> WhisperKit {
+        let cpuCompute = ModelComputeOptions(
+            melCompute: .cpuOnly,
+            audioEncoderCompute: .cpuOnly,
+            textDecoderCompute: .cpuOnly
+        )
+        return try await WhisperKit(
+            modelFolder: modelFolder,
+            computeOptions: cpuCompute,
+            verbose: false
+        )
+    }
+
     private func updateDownloadState(fraction: Double, downloadedBytes: Int64, totalBytes: Int64) {
         let clamped = max(0, min(1, fraction.isFinite ? fraction : 0))
         modelState = .downloading(
@@ -496,6 +520,10 @@ final class SpeechToTextManager: NSObject {
         bufferLock.unlock()
 
         let input = audioEngine.inputNode
+        if hasInputTapInstalled {
+            input.removeTap(onBus: 0)
+            hasInputTapInstalled = false
+        }
         let inputFormat = input.outputFormat(forBus: 0)
         guard let targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -563,15 +591,25 @@ final class SpeechToTextManager: NSObject {
                 }
             }
         }
+        hasInputTapInstalled = true
 
         audioEngine.prepare()
-        try audioEngine.start()
+        do {
+            try audioEngine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            hasInputTapInstalled = false
+            try? AVAudioSession.sharedInstance().setActive(false)
+            throw STTError.audioSessionFailure
+        }
         isListening = true
     }
 
     func stopListening() {
-        guard isListening else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
+        if hasInputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            hasInputTapInstalled = false
+        }
         audioEngine.stop()
         try? AVAudioSession.sharedInstance().setActive(false)
         isListening = false

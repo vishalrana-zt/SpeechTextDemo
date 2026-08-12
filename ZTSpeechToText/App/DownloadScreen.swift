@@ -65,7 +65,7 @@ struct DownloadScreen: View {
                 Image(systemName: "waveform.circle.fill")
                     .font(.title2)
                     .foregroundStyle(Color.accentColor)
-                Text("Model setup")
+                Text("Model Setup")
                     .font(.headline)
 
                 Spacer()
@@ -101,11 +101,11 @@ struct DownloadScreen: View {
                         .foregroundStyle(.secondary)
                 }
 
-            case .loadingModel:
+            case .loadingModel(let loaded, let total):
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("Loading models...")
+                        Text("Loading models (\(loaded) of \(total) loaded)...")
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }

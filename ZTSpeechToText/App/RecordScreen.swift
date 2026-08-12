@@ -11,6 +11,7 @@ struct RecordScreen: View {
 
     private let manager = SpeechToTextManager.shared
     private let autoStartOnAppear: Bool
+    private let onLiveTranscriptChanged: ((String) -> Void)?
     private let onTranscriptReady: ((String) -> Void)?
     private let onProcessingCompleted: (() -> Void)?
     private let minimumRecordingDuration: TimeInterval = 0.45
@@ -30,10 +31,12 @@ struct RecordScreen: View {
 
     init(
         autoStartOnAppear: Bool = false,
+        onLiveTranscriptChanged: ((String) -> Void)? = nil,
         onTranscriptReady: ((String) -> Void)? = nil,
         onProcessingCompleted: (() -> Void)? = nil
     ) {
         self.autoStartOnAppear = autoStartOnAppear
+        self.onLiveTranscriptChanged = onLiveTranscriptChanged
         self.onTranscriptReady = onTranscriptReady
         self.onProcessingCompleted = onProcessingCompleted
     }
@@ -123,18 +126,6 @@ struct RecordScreen: View {
 
             if isListening || isTranscribing {
                 VStack(alignment: .leading, spacing: 6) {
-                    if isTranscribing, let languageStatusText {
-                        Text(languageStatusText)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if let languageDetectionText {
-                        Text(languageDetectionText)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-
                     ListeningWaveformView(
                         isListening: isListening,
                         isTranscribing: isTranscribing,
@@ -142,23 +133,6 @@ struct RecordScreen: View {
                     )
                     .frame(maxWidth: .infinity)
                 }
-            }
-
-            if !transcript.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    if let detectedLanguage {
-                        Text(detectedLanguage.displayName)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(transcript)
-                        .font(.footnote)
-                        .lineLimit(4)
-                        .multilineTextAlignment(.leading)
-                }
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
             if let errorMessage {
@@ -214,6 +188,7 @@ struct RecordScreen: View {
         }
         .onDisappear {
             stopLiveTranscription()
+            manager.stopListening()
             manager.onAudioLevelChange = nil
             manager.onSilenceAutoStopTriggered = nil
             micLevel = 0
@@ -231,26 +206,6 @@ struct RecordScreen: View {
             return Text(statusText)
         }
         return Text("Tap \(Text("Speak now").foregroundStyle(Color.accentColor).fontWeight(.bold)) to start recording")
-    }
-
-    private var languageStatusText: String? {
-        guard let detectedLanguage else { return nil }
-        return "Detected \(detectedLanguage.displayName) audio"
-    }
-
-    private var languageDetectionText: String? {
-        if isTranscribing {
-            if let detectedLanguage {
-                return "Detected \(detectedLanguage.displayName) audio"
-            }
-            return nil
-        }
-
-        if !transcript.isEmpty, let detectedLanguage {
-            return "Detected \(detectedLanguage.displayName) audio"
-        }
-
-        return nil
     }
 
     private var formattedRecordingDuration: String {
@@ -311,6 +266,7 @@ struct RecordScreen: View {
         }
 
         do {
+            manager.stopListening()
             try manager.startListening(
                 autoStopOnSilence: false,
                 silenceDuration: 1.0,
@@ -329,6 +285,7 @@ struct RecordScreen: View {
 
     private func finalizeRecordingSession() {
         stopLiveTranscription()
+        manager.stopListening()
         if let recordingStartedAt {
             lastRecordingDuration = max(0, Date().timeIntervalSince(recordingStartedAt))
         }
@@ -402,6 +359,9 @@ struct RecordScreen: View {
                             await MainActor.run {
                                 transcript = partial.text
                                 detectedLanguage = partial.language
+                                if isLiveTranscriptionEnabled, isListening, !partial.text.isEmpty {
+                                    onLiveTranscriptChanged?(partial.text)
+                                }
                             }
                         }
                     } catch {

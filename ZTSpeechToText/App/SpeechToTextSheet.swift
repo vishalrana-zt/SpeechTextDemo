@@ -24,6 +24,7 @@ private struct SpeechToTextFlowSheet: View {
 
     private let manager = SpeechToTextManager.shared
     private let compactDownloadBarPreferenceKey = "SpeechToTextFlowSheet.prefersCompactDownloadBar"
+    let onLiveTranscriptChanged: (String) -> Void
     let onTextReady: (String) -> Void
     let onSetupReady: () -> Void
     let onCloseRequested: () -> Void
@@ -98,6 +99,9 @@ private struct SpeechToTextFlowSheet: View {
         if case .ready = modelState, !didStartDownloadInThisSession {
             RecordScreen(
                 autoStartOnAppear: shouldAutoStartRecording,
+                onLiveTranscriptChanged: { text in
+                    onLiveTranscriptChanged(text)
+                },
                 onTranscriptReady: { text in
                     onTextReady(text)
                 },
@@ -134,11 +138,11 @@ private struct SpeechToTextFlowSheet: View {
                     .foregroundStyle(Color.accentColor)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Offline Speech")
+                    Text("Model Setup")
                         .font(.headline)
                     TimelineView(.periodic(from: .now, by: 0.6)) { context in
                         let step = Int(context.date.timeIntervalSinceReferenceDate * (1.0 / 0.6)) % 4
-                        Text("Loading bundled model" + String(repeating: ".", count: step))
+                        Text(bundledLoadingText + String(repeating: ".", count: step))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -159,6 +163,13 @@ private struct SpeechToTextFlowSheet: View {
                 )
         )
         .shadow(color: panelShadowColor, radius: 14, y: 4)
+    }
+
+    private var bundledLoadingText: String {
+        if case .loadingModel(let loaded, let total) = modelState {
+            return "Loading bundled models (\(loaded) of \(total) loaded)"
+        }
+        return "Loading bundled model"
     }
 
     private func startDownloadIfNeeded(force: Bool = false) {
@@ -230,6 +241,7 @@ private struct SpeechToTextFlowSheet: View {
 private struct SpeechToTextSheetModifier: ViewModifier {
 
     @Binding var isPresented: Bool
+    let onLiveTranscriptChanged: (String) -> Void
     let onTextReady: (String) -> Void
     let onSetupReady: () -> Void
 
@@ -238,6 +250,9 @@ private struct SpeechToTextSheetModifier: ViewModifier {
             .overlay {
                 if isPresented {
                     SpeechToTextFlowSheet(
+                        onLiveTranscriptChanged: { text in
+                            onLiveTranscriptChanged(text)
+                        },
                         onTextReady: { text in
                             onTextReady(text)
                         },
@@ -258,12 +273,14 @@ private struct SpeechToTextSheetModifier: ViewModifier {
 extension View {
     func speechToTextSheet(
         isPresented: Binding<Bool>,
+        onLiveTranscriptChanged: @escaping (String) -> Void = { _ in },
         onTextReady: @escaping (String) -> Void,
         onSetupReady: @escaping () -> Void = {}
     ) -> some View {
         modifier(
             SpeechToTextSheetModifier(
                 isPresented: isPresented,
+                onLiveTranscriptChanged: onLiveTranscriptChanged,
                 onTextReady: onTextReady,
                 onSetupReady: onSetupReady
             )
