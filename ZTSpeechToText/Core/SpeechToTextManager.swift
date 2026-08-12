@@ -75,7 +75,8 @@ final class SpeechToTextManager: NSObject {
 
     // MARK: - Private
 
-    private var whisperKit: WhisperKit?
+    private var liveWhisperKit: WhisperKit?
+    private var finalWhisperKit: WhisperKit?
     private let audioEngine = AVAudioEngine()
     private var sampleBuffer: [Float] = []
     private let targetSampleRate: Double = 16_000
@@ -88,15 +89,20 @@ final class SpeechToTextManager: NSObject {
     private var accumulatedRecordingDuration: TimeInterval = 0
     private var hasTriggeredAutoStop = false
     private let maxRecordingDuration: TimeInterval = 10 * 60
+    private var tinyDownloadTransfer: CDNModelDownloader.TransferProgress?
+    private var smallDownloadTransfer: CDNModelDownloader.TransferProgress?
 
     var onSilenceAutoStopTriggered: (() -> Void)?
     var onAudioLevelChange: ((Float) -> Void)?
 
-    private static let modelReadyKey = "SpeechToTextManager.modelReady"
+    private static let modelReadyKey = "SpeechToTextManager.modelReadyV2"
     private static let optedInKey = "SpeechToTextManager.optedIn"
     private static let liveTranscriptionEnabledKey = "SpeechToTextManager.liveTranscriptionEnabled"
-    private static let modelName = "openai_whisper-large-v3-v20240930_626MB"
+    private static let tinyModelName = "openai_whisper-tiny"
+    private static let smallModelName = "openai_whisper-small"
     private static let modelRepo = "argmaxinc/whisperkit-coreml"
+    private static let tinyModelZipURL = URL(string: "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-tiny.zip")!
+    private static let smallModelZipURL = URL(string: "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-small.zip")!
     
     /// True once the model is downloaded AND loaded into memory — the only
     /// state in which recording/transcription is actually usable.
@@ -130,6 +136,32 @@ final class SpeechToTextManager: NSObject {
         case huggingface   // HuggingFace hub
     }
 
+    private enum ModelVariant {
+        case tiny
+        case small
+
+        var installFolderName: String {
+            switch self {
+            case .tiny: return "SpeechModelTiny"
+            case .small: return "SpeechModelSmall"
+            }
+        }
+
+        var modelName: String {
+            switch self {
+            case .tiny: return SpeechToTextManager.tinyModelName
+            case .small: return SpeechToTextManager.smallModelName
+            }
+        }
+
+        var cdnZipURL: URL {
+            switch self {
+            case .tiny: return SpeechToTextManager.tinyModelZipURL
+            case .small: return SpeechToTextManager.smallModelZipURL
+            }
+        }
+    }
+
     private static let modelSource: ModelSource = .cdn
     private let cdnDownloader = CDNModelDownloader()
 
@@ -143,56 +175,41 @@ final class SpeechToTextManager: NSObject {
     func prepareOnOptIn() async {
         UserDefaults.standard.set(true, forKey: Self.optedInKey)
 
-        if whisperKit != nil {
+        if liveWhisperKit != nil, finalWhisperKit != nil {
             modelState = .ready
             return
         }
 
-        if let existingModelFolder = installedModelFolderURL() {
-            do {
-                modelState = .loadingModel
-                whisperKit = try await WhisperKit(modelFolder: existingModelFolder.path)
-                modelState = .ready
-                return
-            } catch {
-                // Fall through and attempt fresh preparation/download.
-            }
+        if await loadInstalledModelsIfAvailable() {
+            return
         }
-        
+
         if Self.modelSource == .bundled {
-            await loadBundledModel()
+            await loadBundledModels()
             return
         }
 
         modelState = .downloading(DownloadStatus(progress: 0, downloadedBytes: 0, totalBytes: 0))
+        tinyDownloadTransfer = nil
+        smallDownloadTransfer = nil
 
         do {
-            let modelFolder: URL
+            let tinyModelFolder: URL
+            let smallModelFolder: URL
             if Self.modelSource == .cdn {
-                modelFolder = try await cdnDownloader.downloadAndUnzip { [weak self] transfer in
-                    self?.updateDownloadState(
-                        fraction: transfer.fraction,
-                        downloadedBytes: transfer.downloadedBytes,
-                        totalBytes: transfer.totalBytes
-                    )
-                }
-            } else  {
-                modelFolder = try await WhisperKit.download(
-                    variant: Self.modelName,
-                    from: Self.modelRepo,
-                    progressCallback: { [weak self] progress in
-                        DispatchQueue.main.async {
-                            self?.updateDownloadState(
-                                fraction: progress.fractionCompleted,
-                                downloadedBytes: 0,
-                                totalBytes: 0
-                            )
-                        }
-                    }
-                )
+                tinyModelFolder = try await downloadFromCDN(variant: .tiny)
+                smallModelFolder = try await downloadFromCDN(variant: .small)
+            } else if Self.modelSource == .huggingface {
+                tinyModelFolder = try await WhisperKit.download(variant: Self.tinyModelName, from: Self.modelRepo)
+                smallModelFolder = try await WhisperKit.download(variant: Self.smallModelName, from: Self.modelRepo)
+            } else {
+                modelState = .failed("Unsupported model source.")
+                return
             }
+
             modelState = .loadingModel
-            whisperKit = try await WhisperKit(modelFolder: modelFolder.path)
+            liveWhisperKit = try await WhisperKit(modelFolder: tinyModelFolder.path)
+            finalWhisperKit = try await WhisperKit(modelFolder: smallModelFolder.path)
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
             modelState = .ready
         } catch is CancellationError {
@@ -201,50 +218,28 @@ final class SpeechToTextManager: NSObject {
             modelState = .failed(error.localizedDescription)
         }
     }
-    
-    private func loadBundledModel() async {
-        guard let modelURL = bundledModelURL() else {
-            modelState = .failed("Bundled model '\(Self.modelName)' not found in app bundle")
+
+    private func loadBundledModels() async {
+        guard let tinySourceFolder = bundledModelURL(for: .tiny) else {
+            modelState = .failed("Bundled tiny model '\(ModelVariant.tiny.modelName)' not found in app bundle")
+            return
+        }
+        guard let smallSourceFolder = bundledModelURL(for: .small) else {
+            modelState = .failed("Bundled small model '\(ModelVariant.small.modelName)' not found in app bundle")
             return
         }
 
         do {
             modelState = .loadingModel
-            whisperKit = try await WhisperKit(modelFolder: modelURL.path)
+            let tinyModelFolder = try prepareBundledModelFolder(for: .tiny, sourceFolder: tinySourceFolder)
+            let smallModelFolder = try prepareBundledModelFolder(for: .small, sourceFolder: smallSourceFolder)
+            liveWhisperKit = try await WhisperKit(modelFolder: tinyModelFolder.path)
+            finalWhisperKit = try await WhisperKit(modelFolder: smallModelFolder.path)
+            UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
             modelState = .ready
         } catch {
             modelState = .failed(error.localizedDescription)
         }
-    }
-
-    private func bundledModelURL() -> URL? {
-        let fileManager = FileManager.default
-
-        let candidates: [URL?] = [
-            Bundle.main.url(forResource: Self.modelName, withExtension: nil),
-            Bundle.main.url(forResource: Self.modelName, withExtension: nil, subdirectory: "Resource"),
-            Bundle.main.resourceURL?.appendingPathComponent(Self.modelName, isDirectory: true),
-            Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
-                .appendingPathComponent(Self.modelName, isDirectory: true),
-            Bundle.main.resourceURL
-        ]
-
-        for candidate in candidates.compactMap({ $0 }) {
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                continue
-            }
-
-            // Some project setups flatten resources into the app bundle root.
-            let hasConfig = fileManager.fileExists(atPath: candidate.appendingPathComponent("config.json").path)
-            let hasDecoder = fileManager.fileExists(atPath: candidate.appendingPathComponent("TextDecoder.mlmodelc").path)
-            let hasEncoder = fileManager.fileExists(atPath: candidate.appendingPathComponent("AudioEncoder.mlmodelc").path)
-            if hasConfig && hasDecoder && hasEncoder {
-                return candidate
-            }
-        }
-
-        return nil
     }
 
     /// Call at app launch. Three outcomes:
@@ -275,10 +270,10 @@ final class SpeechToTextManager: NSObject {
         return false
     }
 
-    private func installedModelFolderURL() -> URL? {
+    private func installedModelFolderURL(for variant: ModelVariant) -> URL? {
         let fileManager = FileManager.default
         let destination = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("SpeechModel", isDirectory: true)
+            .appendingPathComponent(variant.installFolderName, isDirectory: true)
 
         if isModelFolder(destination, fileManager: fileManager) {
             return destination
@@ -294,6 +289,145 @@ final class SpeechToTextManager: NSObject {
             return child
         }
         return nil
+    }
+
+    private func bundledModelURL(for variant: ModelVariant) -> URL? {
+        let candidates: [URL?] = [
+            Bundle.main.url(forResource: variant.modelName, withExtension: nil),
+            Bundle.main.url(forResource: variant.modelName, withExtension: "bundle"),
+            Bundle.main.url(forResource: variant.modelName, withExtension: nil, subdirectory: "Resource"),
+            Bundle.main.url(forResource: variant.modelName, withExtension: "bundle", subdirectory: "Resource"),
+            Bundle.main.resourceURL?.appendingPathComponent(variant.modelName, isDirectory: true),
+            Bundle.main.resourceURL?.appendingPathComponent("\(variant.modelName).bundle", isDirectory: true),
+            Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
+                .appendingPathComponent(variant.modelName, isDirectory: true),
+            Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
+                .appendingPathComponent("\(variant.modelName).bundle", isDirectory: true)
+        ]
+
+        for candidate in candidates.compactMap({ $0 }) where isBundledModelFolder(candidate, variant: variant) {
+            return candidate
+        }
+
+        return nil
+    }
+
+    private func isBundledModelFolder(_ url: URL, variant: ModelVariant) -> Bool {
+        let fileManager = FileManager.default
+        if isModelFolder(url, fileManager: fileManager) {
+            return true
+        }
+
+        guard variant == .tiny else { return false }
+
+        let requiredTinyNames = [
+            "tiny_MelSpectrogram.mlmodelc",
+            "tiny_AudioEncoder.mlmodelc",
+            "tiny_TextDecoder.mlmodelc",
+            "tiny_config.json"
+        ]
+        return requiredTinyNames.allSatisfy { name in
+            fileManager.fileExists(atPath: url.appendingPathComponent(name).path)
+        }
+    }
+
+    private func prepareBundledModelFolder(for variant: ModelVariant, sourceFolder: URL) throws -> URL {
+        if variant == .small {
+            return sourceFolder
+        }
+
+        let fileManager = FileManager.default
+        if isModelFolder(sourceFolder, fileManager: fileManager) {
+            return sourceFolder
+        }
+
+        let tempRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("BundledPreparedModels", isDirectory: true)
+        let destination = tempRoot.appendingPathComponent(variant.installFolderName, isDirectory: true)
+
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+
+        let mappings: [(source: String, target: String)] = [
+            ("tiny_AudioEncoder.mlmodelc", "AudioEncoder.mlmodelc"),
+            ("tiny_MelSpectrogram.mlmodelc", "MelSpectrogram.mlmodelc"),
+            ("tiny_TextDecoder.mlmodelc", "TextDecoder.mlmodelc"),
+            ("tiny_config.json", "config.json"),
+            ("tiny_generation_config.json", "generation_config.json")
+        ]
+
+        for mapping in mappings {
+            let source = sourceFolder.appendingPathComponent(mapping.source)
+            let target = destination.appendingPathComponent(mapping.target)
+            if fileManager.fileExists(atPath: source.path) {
+                try fileManager.copyItem(at: source, to: target)
+            }
+        }
+
+        guard isModelFolder(destination, fileManager: fileManager) else {
+            throw STTError.notReady
+        }
+
+        return destination
+    }
+
+    private func loadInstalledModelsIfAvailable() async -> Bool {
+        guard let tinyModelFolder = installedModelFolderURL(for: .tiny),
+              let smallModelFolder = installedModelFolderURL(for: .small) else {
+            return false
+        }
+
+        do {
+            modelState = .loadingModel
+            liveWhisperKit = try await WhisperKit(modelFolder: tinyModelFolder.path)
+            finalWhisperKit = try await WhisperKit(modelFolder: smallModelFolder.path)
+            modelState = .ready
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func downloadFromCDN(variant: ModelVariant) async throws -> URL {
+        try await cdnDownloader.downloadAndUnzip(
+            modelZipURL: variant.cdnZipURL,
+            installFolderName: variant.installFolderName
+        ) { [weak self] transfer in
+            self?.updateDownloadState(for: variant, transfer: transfer)
+        }
+    }
+
+    private func updateDownloadState(for variant: ModelVariant, transfer: CDNModelDownloader.TransferProgress) {
+        switch variant {
+        case .tiny:
+            tinyDownloadTransfer = transfer
+        case .small:
+            smallDownloadTransfer = transfer
+        }
+
+        let tinyDownloaded = tinyDownloadTransfer?.downloadedBytes ?? 0
+        let smallDownloaded = smallDownloadTransfer?.downloadedBytes ?? 0
+        let tinyTotal = tinyDownloadTransfer?.totalBytes ?? 0
+        let smallTotal = smallDownloadTransfer?.totalBytes ?? 0
+
+        let combinedDownloaded = max(0, tinyDownloaded + smallDownloaded)
+        let combinedTotal = max(0, tinyTotal + smallTotal)
+        let combinedFraction: Double
+        if combinedTotal > 0 {
+            combinedFraction = Double(combinedDownloaded) / Double(combinedTotal)
+        } else {
+            let tinyFraction = tinyDownloadTransfer?.fraction ?? 0
+            let smallFraction = smallDownloadTransfer?.fraction ?? 0
+            combinedFraction = (tinyFraction + smallFraction) * 0.5
+        }
+
+        updateDownloadState(
+            fraction: combinedFraction,
+            downloadedBytes: combinedDownloaded,
+            totalBytes: combinedTotal
+        )
     }
 
     private func isModelFolder(_ url: URL, fileManager: FileManager) -> Bool {
@@ -455,7 +589,7 @@ final class SpeechToTextManager: NSObject {
     ///   If provided, transcription is forced to that language.
     func transcribe(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
         if isListening { stopListening() }
-        guard let whisperKit else { throw STTError.notReady }
+        guard let finalWhisperKit else { throw STTError.notReady }
 
         let audio = snapshotAudioBuffer()
 
@@ -465,14 +599,14 @@ final class SpeechToTextManager: NSObject {
         if let preferredLanguage {
             resolvedLanguage = preferredLanguage
         } else {
-            resolvedLanguage = try await detectSupportedLanguage(audio: audio, using: whisperKit)
+            resolvedLanguage = try await detectSupportedLanguage(audio: audio, using: finalWhisperKit)
         }
 
         var options = DecodingOptions()
         options.language = resolvedLanguage.rawValue
         options.detectLanguage = false
 
-        let results = try await whisperKit.transcribe(audioArray: audio, decodeOptions: options)
+        let results = try await finalWhisperKit.transcribe(audioArray: audio, decodeOptions: options)
         guard let first = results.first else { throw STTError.emptyRecording }
 
         let text = first.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -486,7 +620,7 @@ final class SpeechToTextManager: NSObject {
         maxAudioSeconds: Double = 8.0,
         minimumAudioSeconds: Double = 0.8
     ) async throws -> (text: String, language: SupportedLanguage)? {
-        guard let whisperKit else { throw STTError.notReady }
+        guard let liveWhisperKit else { throw STTError.notReady }
 
         let fullAudio = snapshotAudioBuffer()
         let minimumSamples = Int(targetSampleRate * max(0.2, minimumAudioSeconds))
@@ -497,14 +631,14 @@ final class SpeechToTextManager: NSObject {
         if let preferredLanguage {
             resolvedLanguage = preferredLanguage
         } else {
-            resolvedLanguage = try await detectSupportedLanguage(audio: audioWindow, using: whisperKit)
+            resolvedLanguage = try await detectSupportedLanguage(audio: audioWindow, using: liveWhisperKit)
         }
 
         var options = DecodingOptions()
         options.language = resolvedLanguage.rawValue
         options.detectLanguage = false
 
-        let results = try await whisperKit.transcribe(audioArray: audioWindow, decodeOptions: options)
+        let results = try await liveWhisperKit.transcribe(audioArray: audioWindow, decodeOptions: options)
         guard let first = results.first else { return nil }
 
         let text = first.text.trimmingCharacters(in: .whitespacesAndNewlines)

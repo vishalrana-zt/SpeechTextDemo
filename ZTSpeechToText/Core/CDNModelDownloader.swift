@@ -1,6 +1,6 @@
 //
 //  CDNModelDownloader.swift
-//  Downloads model zip from CDN with relaunch-safe resume support.
+//  Resume-safe downloader for CDN-hosted Whisper model zips.
 //
 
 import Foundation
@@ -12,14 +12,18 @@ final class CDNModelDownloader: NSObject {
         case badResponse
         case unzipFailed
         case fileIOFailure
+        case invalidRequest
     }
-
-    static let modelZipURL = URL(string: "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-large-v3-v20240930_626MB.zip")!
 
     struct TransferProgress {
         let fraction: Double
         let downloadedBytes: Int64
         let totalBytes: Int64
+    }
+
+    private struct ActiveRequest {
+        let modelZipURL: URL
+        let installFolderName: String
     }
 
     private let stateLock = NSLock()
@@ -31,22 +35,24 @@ final class CDNModelDownloader: NSObject {
     private var bytesReceivedThisSession: Int64 = 0
     private var totalBytesExpected: Int64 = 0
     private var retryAttempt: Int = 0
+    private var activeRequest: ActiveRequest?
 
     private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
 
-    private var partialZipURL: URL {
-        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("SpeechModelDownload", isDirectory: true)
-            .appendingPathComponent("model.zip.part")
-    }
+    func downloadAndUnzip(
+        modelZipURL: URL,
+        installFolderName: String,
+        progressCallback: @escaping (TransferProgress) -> Void
+    ) async throws -> URL {
+        let request = ActiveRequest(modelZipURL: modelZipURL, installFolderName: installFolderName)
 
-    func downloadAndUnzip(progressCallback: @escaping (TransferProgress) -> Void) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
+        return try await withCheckedThrowingContinuation { continuation in
             stateLock.lock()
             self.progressCallback = progressCallback
             continuations.append(continuation)
 
             if activeDataTask == nil {
+                activeRequest = request
                 do {
                     try startDataDownloadLocked()
                     let task = activeDataTask
@@ -57,6 +63,7 @@ final class CDNModelDownloader: NSObject {
                     let pending = continuations
                     continuations.removeAll()
                     self.progressCallback = nil
+                    activeRequest = nil
                     stateLock.unlock()
                     for continuation in pending {
                         continuation.resume(throwing: error)
@@ -69,33 +76,48 @@ final class CDNModelDownloader: NSObject {
         }
     }
 
+    private func partialZipURL(for request: ActiveRequest) -> URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SpeechModelDownload", isDirectory: true)
+            .appendingPathComponent("\(request.installFolderName).zip.part")
+    }
+
+    private func destinationFolderURL(for request: ActiveRequest) -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(request.installFolderName, isDirectory: true)
+    }
+
     private func startDataDownloadLocked() throws {
+        guard let request = activeRequest else { throw DownloadError.invalidRequest }
+        let partialURL = partialZipURL(for: request)
         let fileManager = FileManager.default
-        let directory = partialZipURL.deletingLastPathComponent()
+        let directory = partialURL.deletingLastPathComponent()
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        if !fileManager.fileExists(atPath: partialZipURL.path) {
-            guard fileManager.createFile(atPath: partialZipURL.path, contents: nil) else {
+        if !fileManager.fileExists(atPath: partialURL.path) {
+            guard fileManager.createFile(atPath: partialURL.path, contents: nil) else {
                 throw DownloadError.fileIOFailure
             }
         }
 
-        let attributes = try fileManager.attributesOfItem(atPath: partialZipURL.path)
+        let attributes = try fileManager.attributesOfItem(atPath: partialURL.path)
         bytesAlreadyOnDisk = (attributes[.size] as? NSNumber)?.int64Value ?? 0
         bytesReceivedThisSession = 0
         totalBytesExpected = 0
 
-        var request = URLRequest(url: Self.modelZipURL)
+        var urlRequest = URLRequest(url: request.modelZipURL)
         if bytesAlreadyOnDisk > 0 {
-            request.setValue("bytes=\(bytesAlreadyOnDisk)-", forHTTPHeaderField: "Range")
+            urlRequest.setValue("bytes=\(bytesAlreadyOnDisk)-", forHTTPHeaderField: "Range")
         }
 
-        let task = session.dataTask(with: request)
+        let task = session.dataTask(with: urlRequest)
         activeDataTask = task
     }
 
     private func openOutputHandle(append: Bool) throws {
-        let handle = try FileHandle(forWritingTo: partialZipURL)
+        guard let request = activeRequest else { throw DownloadError.invalidRequest }
+        let partialURL = partialZipURL(for: request)
+        let handle = try FileHandle(forWritingTo: partialURL)
         if append {
             _ = try handle.seekToEnd()
         } else {
@@ -105,10 +127,11 @@ final class CDNModelDownloader: NSObject {
         outputHandle = handle
     }
 
-    private func unzip(_ zipURL: URL) throws -> URL {
+    private func unzip() throws -> URL {
+        guard let request = activeRequest else { throw DownloadError.invalidRequest }
         let fileManager = FileManager.default
-        let destination = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("SpeechModel", isDirectory: true)
+        let partialURL = partialZipURL(for: request)
+        let destination = destinationFolderURL(for: request)
 
         if fileManager.fileExists(atPath: destination.path) {
             try fileManager.removeItem(at: destination)
@@ -116,16 +139,16 @@ final class CDNModelDownloader: NSObject {
         try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
 
         do {
-            try fileManager.unzipItem(at: zipURL, to: destination)
+            try fileManager.unzipItem(at: partialURL, to: destination)
         } catch {
             throw DownloadError.unzipFailed
         }
+
         return try resolvedModelFolder(in: destination)
     }
 
     private func resolvedModelFolder(in destination: URL) throws -> URL {
         let fileManager = FileManager.default
-
         if isModelFolder(destination, fileManager: fileManager) {
             return destination
         }
@@ -136,10 +159,8 @@ final class CDNModelDownloader: NSObject {
             options: [.skipsHiddenFiles]
         )) ?? []
 
-        for child in children {
-            if isModelFolder(child, fileManager: fileManager) {
-                return child
-            }
+        for child in children where isModelFolder(child, fileManager: fileManager) {
+            return child
         }
 
         throw DownloadError.unzipFailed
@@ -157,15 +178,12 @@ final class CDNModelDownloader: NSObject {
             "TextDecoder.mlmodelc",
             "config.json"
         ]
-
-        return requiredNames.allSatisfy { name in
-            fileManager.fileExists(atPath: url.appendingPathComponent(name).path)
-        }
+        return requiredNames.allSatisfy { fileManager.fileExists(atPath: url.appendingPathComponent($0).path) }
     }
 
     private func finalizeFromPartialFile() {
         do {
-            let modelFolder = try unzip(partialZipURL)
+            let modelFolder = try unzip()
             resolveAll(.success(modelFolder))
         } catch {
             resolveAll(.failure(error))
@@ -238,6 +256,7 @@ final class CDNModelDownloader: NSObject {
         bytesReceivedThisSession = 0
         totalBytesExpected = 0
         retryAttempt = 0
+        activeRequest = nil
         stateLock.unlock()
 
         for continuation in pending {
@@ -328,12 +347,11 @@ extension CDNModelDownloader: URLSessionDataDelegate {
                 fraction = 0
             }
 
-            let progress = TransferProgress(
+            progressToSend = TransferProgress(
                 fraction: fraction,
                 downloadedBytes: downloaded,
                 totalBytes: total
             )
-            progressToSend = progress
             callback = progressCallback
         } catch {
             writeError = error
