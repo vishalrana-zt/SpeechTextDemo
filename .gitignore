@@ -15,3 +15,5 @@ xcuserdata/
 *.xcarchive
 *.ipa
 *.dSYM
+/ZTSpeechToText/Resource/openai_whisper-small
+/ZTSpeechToText/Resource/openai_whisper-tiny
