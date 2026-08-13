@@ -28,6 +28,8 @@ struct LiveTranscriptReconciler {
     private var updateCounter: Int = 0
     private var lastRenderedText: String = ""
     private var rejectedIncomingStreak: Int = 0
+    private var pendingStableCommitChunk: String = ""
+    private var pendingStableCommitHits: Int = 0
 
     /// Segments older than current rolling-window start minus this tolerance are
     /// moved from provisional to committed text.
@@ -40,9 +42,9 @@ struct LiveTranscriptReconciler {
         pattern: #"\s{2,}"#,
         options: []
     )
-    private let mutableTailWordsForTextCommit = 8
+    private let mutableTailWordsForTextCommit = 10
     private let minimumWordsForTailCommit = 12
-    private let maximumProvisionalWords = 14
+    private let maximumProvisionalWords = 18
     private let earlyCommitFreezeSeconds: TimeInterval = 3.0
 
     mutating func beginSession(_ sessionID: UUID) {
@@ -54,6 +56,8 @@ struct LiveTranscriptReconciler {
         updateCounter = 0
         lastRenderedText = ""
         rejectedIncomingStreak = 0
+        pendingStableCommitChunk = ""
+        pendingStableCommitHits = 0
     }
 
     mutating func reset() {
@@ -65,6 +69,8 @@ struct LiveTranscriptReconciler {
         updateCounter = 0
         lastRenderedText = ""
         rejectedIncomingStreak = 0
+        pendingStableCommitChunk = ""
+        pendingStableCommitHits = 0
     }
 
     mutating func apply(_ partial: LiveTranscriptPartial) -> LiveTranscriptRenderState? {
@@ -130,7 +136,10 @@ struct LiveTranscriptReconciler {
         if !shouldFreezeCommit,
            let stableChunk = stableTextCommitChunk(previous: previousProvisionalText, current: provisionalText),
            !stableChunk.isEmpty {
-            committedText = stitch(left: committedText, right: stableChunk)
+            maybeCommitStableChunk(stableChunk)
+        } else {
+            pendingStableCommitChunk = ""
+            pendingStableCommitHits = 0
         }
         provisionalText = trimCommittedPrefix(from: provisionalText, committed: committedText)
         enforceProvisionalTailLimit()
@@ -318,6 +327,21 @@ struct LiveTranscriptReconciler {
         return words.prefix(commitWordCount).joined(separator: " ")
     }
 
+    private mutating func maybeCommitStableChunk(_ chunk: String) {
+        let normalized = sanitize(chunk)
+        guard !normalized.isEmpty else { return }
+        if pendingStableCommitChunk == normalized {
+            pendingStableCommitHits += 1
+        } else {
+            pendingStableCommitChunk = normalized
+            pendingStableCommitHits = 1
+        }
+        guard pendingStableCommitHits >= 2 else { return }
+        committedText = stitch(left: committedText, right: normalized)
+        pendingStableCommitChunk = ""
+        pendingStableCommitHits = 0
+    }
+
     private func commonPrefix(_ a: String, _ b: String) -> String {
         var result = ""
         var ia = a.startIndex
@@ -405,7 +429,9 @@ struct LiveTranscriptReconciler {
                 guard !cleaned.isEmpty else { return nil }
                 let shiftedWords = cleaned.split(whereSeparator: \.isWhitespace).map(String.init)
                 // Ignore tiny shifted-out fragments; these are often jitter artifacts.
-                guard shiftedWords.count >= 3 else { return nil }
+                // Keep early short phrases so we don't lose the very start of speech.
+                let minimumShiftedWords = committedText.isEmpty ? 2 : 4
+                guard shiftedWords.count >= minimumShiftedWords else { return nil }
                 // Avoid echoing text that's already in committed history.
                 let committedTailWords = committedText
                     .split(whereSeparator: \.isWhitespace)
@@ -434,6 +460,7 @@ struct LiveTranscriptReconciler {
 
         let oldWords = old.split(whereSeparator: \.isWhitespace).map(String.init)
         let newWords = next.split(whereSeparator: \.isWhitespace).map(String.init)
+        let shrinkRatio = Double(newWords.count) / Double(max(oldWords.count, 1))
         let maxOverlap = min(oldWords.count, newWords.count)
         if maxOverlap == 0 { return false }
 
@@ -441,6 +468,14 @@ struct LiveTranscriptReconciler {
             let oldTail = oldWords.suffix(overlap).map(normalizeWord)
             let newHead = newWords.prefix(overlap).map(normalizeWord)
             if oldTail == newHead {
+                // For shorter replacements, require stronger overlap to avoid
+                // accepting noisy regressions that chop stable context.
+                if shrinkRatio < 0.75 {
+                    return overlap >= 2
+                }
+                if shrinkRatio < 0.90 {
+                    return overlap >= 1 && (overlap >= 2 || newWords.count <= 3)
+                }
                 return true
             }
         }

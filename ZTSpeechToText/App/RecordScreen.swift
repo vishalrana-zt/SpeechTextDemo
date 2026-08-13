@@ -41,8 +41,16 @@ struct RecordScreen: View {
         pattern: #"(^|\s)-\s+"#,
         options: []
     )
+    private let dialogChevronRegex = try! NSRegularExpression(
+        pattern: #"(^|\s)>>+\s*"#,
+        options: []
+    )
     private let parentheticalNonSpeechRegex = try! NSRegularExpression(
         pattern: #"\((?:\s*(?:music|upbeat music|laughs?|laughter|inaudible|sighs?)\s*)\)"#,
+        options: [.caseInsensitive]
+    )
+    private let accentedNtRegex = try! NSRegularExpression(
+        pattern: #"\b([A-Za-z]+)n[íìîï]t\b"#,
         options: [.caseInsensitive]
     )
 
@@ -63,6 +71,7 @@ struct RecordScreen: View {
     @State private var isRecordingTransitionInFlight = false
     @State private var liveTaskGeneration: Int = 0
     @State private var hasFinishedFirstLiveDecodeAttempt = false
+    @State private var liveRecentDecodeLatencyMs: Double?
 
     private let liveDebugLoggingEnabled = true
 
@@ -515,6 +524,7 @@ struct RecordScreen: View {
                 guard generation == liveTaskGeneration else { return }
                 liveTickCounter = 0
                 hasFinishedFirstLiveDecodeAttempt = false
+                liveRecentDecodeLatencyMs = nil
                 liveDebugLog("start_live_task gen=\(generation) max=\(livePartialMaxAudioSeconds)s min=\(livePartialMinimumAudioSeconds)s poll=\(livePollingIntervalNanoseconds)")
             }
             while !Task.isCancelled {
@@ -532,14 +542,28 @@ struct RecordScreen: View {
                         return UInt64(220_000_000)
                     }
                     // Back off while mostly silent to reduce battery/CPU pressure.
-                    return micLevel < 0.05
+                    let baseInterval = micLevel < 0.05
                         ? min(UInt64(Double(livePollingIntervalNanoseconds) * 2.0), 1_600_000_000)
                         : livePollingIntervalNanoseconds
+                    // Use recent decode latency as a conservative backpressure signal.
+                    // This avoids issuing new work faster than the decoder can settle.
+                    let decodeBackpressureInterval: UInt64
+                    if let liveRecentDecodeLatencyMs {
+                        decodeBackpressureInterval = UInt64(
+                            min(
+                                max(liveRecentDecodeLatencyMs * 1_300_000.0, 220_000_000),
+                                1_400_000_000
+                            )
+                        )
+                    } else {
+                        decodeBackpressureInterval = 0
+                    }
+                    return max(baseInterval, decodeBackpressureInterval)
                 }
 
                 if !(await MainActor.run { hasFinishedFirstLiveDecodeAttempt }) {
                     let bufferedSeconds = manager.currentBufferedAudioSeconds()
-                    if bufferedSeconds < 1.10 {
+                    if bufferedSeconds < 1.00 {
                         try? await Task.sleep(nanoseconds: effectivePollingInterval)
                         continue
                     }
@@ -552,7 +576,7 @@ struct RecordScreen: View {
                         maxAudioSeconds: livePartialMaxAudioSeconds,
                         minimumAudioSeconds: hasLoggedFirstLiveText
                             ? livePartialMinimumAudioSeconds
-                            : max(1.10, livePartialMinimumAudioSeconds)
+                            : max(1.00, livePartialMinimumAudioSeconds)
                     ) {
                         await MainActor.run {
                             guard generation == liveTaskGeneration,
@@ -563,7 +587,13 @@ struct RecordScreen: View {
                                 return
                             }
                             liveTickCounter += 1
-                            liveDebugLog("tick=\(liveTickCounter) decode_ms=\(Int(Date().timeIntervalSince(decodeStartedAt) * 1000))")
+                            let decodeLatencyMs = Double(Int(Date().timeIntervalSince(decodeStartedAt) * 1000))
+                            if let liveRecentDecodeLatencyMs {
+                                self.liveRecentDecodeLatencyMs = (liveRecentDecodeLatencyMs * 0.7) + (decodeLatencyMs * 0.3)
+                            } else {
+                                self.liveRecentDecodeLatencyMs = decodeLatencyMs
+                            }
+                            liveDebugLog("tick=\(liveTickCounter) decode_ms=\(Int(decodeLatencyMs))")
                             let cleaned = cleanedTranscript(partial.text)
                             liveDebugLog("tick=\(liveTickCounter) raw=\"\(partial.text)\"")
                             liveDebugLog("tick=\(liveTickCounter) cleaned=\"\(cleaned)\"")
@@ -689,13 +719,36 @@ struct RecordScreen: View {
             withTemplate: " "
         )
         let rangeAfterDialogDash = NSRange(location: 0, length: (withoutDialogDash as NSString).length)
-        let normalizedWhitespace = multiWhitespaceRegex.stringByReplacingMatches(
+        let withoutDialogChevron = dialogChevronRegex.stringByReplacingMatches(
             in: withoutDialogDash,
             options: [],
             range: rangeAfterDialogDash,
             withTemplate: " "
         )
-        return normalizedWhitespace.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rangeAfterDialogChevron = NSRange(location: 0, length: (withoutDialogChevron as NSString).length)
+        let normalizedWhitespace = multiWhitespaceRegex.stringByReplacingMatches(
+            in: withoutDialogChevron,
+            options: [],
+            range: rangeAfterDialogChevron,
+            withTemplate: " "
+        )
+        let normalizedQuotes = normalizedWhitespace
+            .replacingOccurrences(of: "’", with: "'")
+            .replacingOccurrences(of: "‘", with: "'")
+            .replacingOccurrences(of: "ʼ", with: "'")
+            .replacingOccurrences(of: "`", with: "'")
+            .replacingOccurrences(of: "´", with: "'")
+        guard preferredLanguage == .english else {
+            return normalizedQuotes.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let rangeAfterQuoteNormalization = NSRange(location: 0, length: (normalizedQuotes as NSString).length)
+        let normalizedCommonContractions = accentedNtRegex.stringByReplacingMatches(
+            in: normalizedQuotes,
+            options: [],
+            range: rangeAfterQuoteNormalization,
+            withTemplate: "$1n't"
+        )
+        return normalizedCommonContractions.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     @MainActor
