@@ -6,6 +6,16 @@
 import SwiftUI
 import UserNotifications
 
+struct SpeechToTextSheetConfiguration {
+    var preferredLanguage: SpeechToTextManager.SupportedLanguage? = nil
+    var operationMode: SpeechToTextManager.OperationMode = .liveStreaming
+    var initialLiveTranscriptionEnabled: Bool? = nil
+    var showsLiveTranscriptionToggle: Bool = false
+    var livePartialMaxAudioSeconds: Double = 12.0
+    var livePartialMinimumAudioSeconds: Double = 0.8
+    var livePollingIntervalNanoseconds: UInt64 = 1_200_000_000
+}
+
 private struct SpeechToTextFlowSheet: View {
 
     @Environment(\.colorScheme) private var colorScheme
@@ -19,14 +29,14 @@ private struct SpeechToTextFlowSheet: View {
     @State private var showNotifyInfoAlert = false
     @State private var notifyInfoTitle = ""
     @State private var notifyInfoMessage = ""
-    @State private var shouldAutoStartRecording = true
+    @State private var shouldAutoStartRecording = false
     @State private var showSetupReadyAlert = false
 
     private let manager = SpeechToTextManager.shared
     private let compactDownloadBarPreferenceKey = "SpeechToTextFlowSheet.prefersCompactDownloadBar"
-    let preferredLanguage: SpeechToTextManager.SupportedLanguage?
-    let onLiveTranscriptChanged: (String) -> Void
-    let onTextReady: (String) -> Void
+    let configuration: SpeechToTextSheetConfiguration
+    let onLiveTranscriptChanged: (LiveTranscriptPartial) -> Void
+    let onTextReady: (UUID, String) -> Void
     let onSetupReady: () -> Void
     let onCloseRequested: () -> Void
 
@@ -36,9 +46,10 @@ private struct SpeechToTextFlowSheet: View {
             .padding(.bottom, 8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             .onAppear {
+                manager.setOperationMode(configuration.operationMode)
                 hasCollapsedToCompactDownloadingBar = UserDefaults.standard.bool(forKey: compactDownloadBarPreferenceKey)
                 modelState = manager.modelState
-                shouldAutoStartRecording = true
+                shouldAutoStartRecording = false
 
                 manager.onModelStateChange = { state in
                     DispatchQueue.main.async { modelState = state }
@@ -75,7 +86,7 @@ private struct SpeechToTextFlowSheet: View {
                     if wantsSetupCompletionNotification {
                         scheduleSetupReadyNotification()
                     }
-                    shouldAutoStartRecording = true
+                    shouldAutoStartRecording = false
                     didStartDownloadInThisSession = true
                     showSetupReadyAlert = true
                     onSetupReady()
@@ -100,12 +111,17 @@ private struct SpeechToTextFlowSheet: View {
         if case .ready = modelState, !didStartDownloadInThisSession {
             RecordScreen(
                 autoStartOnAppear: shouldAutoStartRecording,
-                preferredLanguage: preferredLanguage,
-                onLiveTranscriptChanged: { text in
-                    onLiveTranscriptChanged(text)
+                preferredLanguage: configuration.preferredLanguage,
+                initialLiveTranscriptionEnabled: configuration.initialLiveTranscriptionEnabled,
+                showsLiveTranscriptionToggle: configuration.showsLiveTranscriptionToggle,
+                livePartialMaxAudioSeconds: configuration.livePartialMaxAudioSeconds,
+                livePartialMinimumAudioSeconds: configuration.livePartialMinimumAudioSeconds,
+                livePollingIntervalNanoseconds: configuration.livePollingIntervalNanoseconds,
+                onLiveTranscriptChanged: { partial in
+                    onLiveTranscriptChanged(partial)
                 },
-                onTranscriptReady: { text in
-                    onTextReady(text)
+                onTranscriptReady: { sessionID, text in
+                    onTextReady(sessionID, text)
                 },
                 onProcessingCompleted: {
                     onCloseRequested()
@@ -139,16 +155,13 @@ private struct SpeechToTextFlowSheet: View {
                     .font(.title2)
                     .foregroundStyle(Color.accentColor)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Model Setup")
-                        .font(.headline)
-                    TimelineView(.periodic(from: .now, by: 0.6)) { context in
-                        let step = Int(context.date.timeIntervalSinceReferenceDate * (1.0 / 0.6)) % 4
-                        Text(bundledLoadingText + String(repeating: ".", count: step))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                TimelineView(.periodic(from: .now, by: 0.6)) { context in
+                    let step = Int(context.date.timeIntervalSinceReferenceDate * (1.0 / 0.6)) % 4
+                    Text(bundledLoadingText + String(repeating: ".", count: step))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             ProgressView()
@@ -168,10 +181,7 @@ private struct SpeechToTextFlowSheet: View {
     }
 
     private var bundledLoadingText: String {
-        if case .loadingModel(let loaded, let total) = modelState {
-            return "Loading bundled models (\(loaded) of \(total) loaded)"
-        }
-        return "Loading bundled model"
+        return "Loading model"
     }
 
     private func startDownloadIfNeeded(force: Bool = false) {
@@ -243,9 +253,9 @@ private struct SpeechToTextFlowSheet: View {
 private struct SpeechToTextSheetModifier: ViewModifier {
 
     @Binding var isPresented: Bool
-    let preferredLanguage: SpeechToTextManager.SupportedLanguage?
-    let onLiveTranscriptChanged: (String) -> Void
-    let onTextReady: (String) -> Void
+    let configuration: SpeechToTextSheetConfiguration
+    let onLiveTranscriptChanged: (LiveTranscriptPartial) -> Void
+    let onTextReady: (UUID, String) -> Void
     let onSetupReady: () -> Void
 
     func body(content: Content) -> some View {
@@ -253,12 +263,12 @@ private struct SpeechToTextSheetModifier: ViewModifier {
             .overlay {
                 if isPresented {
                     SpeechToTextFlowSheet(
-                        preferredLanguage: preferredLanguage,
-                        onLiveTranscriptChanged: { text in
-                            onLiveTranscriptChanged(text)
+                        configuration: configuration,
+                        onLiveTranscriptChanged: { partial in
+                            onLiveTranscriptChanged(partial)
                         },
-                        onTextReady: { text in
-                            onTextReady(text)
+                        onTextReady: { sessionID, text in
+                            onTextReady(sessionID, text)
                         },
                         onSetupReady: {
                             onSetupReady()
@@ -277,19 +287,37 @@ private struct SpeechToTextSheetModifier: ViewModifier {
 extension View {
     func speechToTextSheet(
         isPresented: Binding<Bool>,
-        preferredLanguage: SpeechToTextManager.SupportedLanguage? = nil,
-        onLiveTranscriptChanged: @escaping (String) -> Void = { _ in },
-        onTextReady: @escaping (String) -> Void,
+        configuration: SpeechToTextSheetConfiguration = SpeechToTextSheetConfiguration(),
+        onLiveTranscriptChanged: @escaping (LiveTranscriptPartial) -> Void = { _ in },
+        onTextReady: @escaping (UUID, String) -> Void,
         onSetupReady: @escaping () -> Void = {}
     ) -> some View {
         modifier(
             SpeechToTextSheetModifier(
                 isPresented: isPresented,
-                preferredLanguage: preferredLanguage,
+                configuration: configuration,
                 onLiveTranscriptChanged: onLiveTranscriptChanged,
                 onTextReady: onTextReady,
                 onSetupReady: onSetupReady
             )
+        )
+    }
+
+    func speechToTextSheet(
+        isPresented: Binding<Bool>,
+        preferredLanguage: SpeechToTextManager.SupportedLanguage? = nil,
+        onLiveTranscriptChanged: @escaping (LiveTranscriptPartial) -> Void = { _ in },
+        onTextReady: @escaping (UUID, String) -> Void,
+        onSetupReady: @escaping () -> Void = {}
+    ) -> some View {
+        var configuration = SpeechToTextSheetConfiguration()
+        configuration.preferredLanguage = preferredLanguage
+        return speechToTextSheet(
+            isPresented: isPresented,
+            configuration: configuration,
+            onLiveTranscriptChanged: onLiveTranscriptChanged,
+            onTextReady: onTextReady,
+            onSetupReady: onSetupReady
         )
     }
 }

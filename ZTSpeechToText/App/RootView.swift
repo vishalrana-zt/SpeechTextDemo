@@ -8,22 +8,61 @@ import UIKit
 
 struct RootView: View {
 
+    private enum CaptureMode: String, CaseIterable, Identifiable {
+        case liveStreaming
+        case postRecording
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .liveStreaming: return "Live streaming"
+            case .postRecording: return "Post recording"
+            }
+        }
+
+        var managerMode: SpeechToTextManager.OperationMode {
+            switch self {
+            case .liveStreaming: return .liveStreaming
+            case .postRecording: return .postRecording
+            }
+        }
+    }
+
     @State private var noteText = ""
     @State private var isSpeechToTextSheetPresented = false
-    @State private var hasLiveTranscriptDraft = false
-    @State private var baseNoteTextBeforeLiveDraft = ""
-    @State private var liveAccumulatedTranscript = ""
-    @State private var lastLivePartialTranscript = ""
-    @State private var liveHighlightRequest: LiveHighlightRequest?
-    @State private var preferredSTTLanguage: SpeechToTextManager.SupportedLanguage? = .english
+    @State private var highlightRequest: SpeechHighlightRequest?
+    @State private var liveSessionID: UUID?
+    @State private var liveDraftBaseText = ""
+    @State private var livePreviewText = ""
+    @State private var liveReconciler = LiveTranscriptReconciler()
+    @State private var selectedLanguage: SpeechToTextManager.SupportedLanguage = RootView.defaultSupportedLanguage()
+    @State private var selectedMode: CaptureMode = .postRecording
+    private let liveDebugLoggingEnabled = true
 
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Language", selection: $selectedLanguage) {
+                        ForEach(SpeechToTextManager.SupportedLanguage.allCases, id: \.self) { language in
+                            Text(language.displayName).tag(language)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Picker("Mode", selection: $selectedMode) {
+                        ForEach(CaptureMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
                 LiveAwareTextView(
                     text: $noteText,
-                    highlightRequest: liveHighlightRequest,
-                    shouldAutoScrollLiveInsertion: hasLiveTranscriptDraft
+                    highlightRequest: highlightRequest,
+                    shouldAutoScrollLiveInsertion: selectedMode == .liveStreaming && isSpeechToTextSheetPresented
                 )
                     .padding(4)
                     .background(
@@ -63,23 +102,34 @@ struct RootView: View {
         }
         .speechToTextSheet(
             isPresented: $isSpeechToTextSheetPresented,
-            preferredLanguage: preferredSTTLanguage,
-            onLiveTranscriptChanged: { partialText in
-                applyLiveTranscriptDraft(partialText)
+            configuration: sheetConfiguration,
+            onLiveTranscriptChanged: { partial in
+                applyLiveTranscriptPartial(partial)
             },
-            onTextReady: { transcribedText in
-                commitFinalTranscript(transcribedText)
+            onTextReady: { sessionID, transcribedText in
+                commitFinalTranscript(sessionID: sessionID, transcribedText)
             }
         )
         .onChange(of: isSpeechToTextSheetPresented) { _, isPresented in
-            if !isPresented, hasLiveTranscriptDraft {
-                hasLiveTranscriptDraft = false
-                baseNoteTextBeforeLiveDraft = noteText
-                liveAccumulatedTranscript = ""
-                lastLivePartialTranscript = ""
-                liveHighlightRequest = nil
+            if !isPresented {
+                resetLiveDraftState(clearPreview: true)
             }
         }
+        .onChange(of: selectedMode) { _, _ in
+            resetLiveDraftState(clearPreview: false)
+        }
+    }
+
+    private var sheetConfiguration: SpeechToTextSheetConfiguration {
+        SpeechToTextSheetConfiguration(
+            preferredLanguage: selectedLanguage,
+            operationMode: selectedMode.managerMode,
+            initialLiveTranscriptionEnabled: selectedMode == .liveStreaming,
+            showsLiveTranscriptionToggle: false,
+            livePartialMaxAudioSeconds: 6.0,
+            livePartialMinimumAudioSeconds: 0.6,
+            livePollingIntervalNanoseconds: 600_000_000
+        )
     }
 
     private func merge(_ baseText: String, with transcript: String) -> String {
@@ -92,115 +142,121 @@ struct RootView: View {
     }
 
     private func appendTranscript(_ transcript: String) {
-        let merged = merge(noteText, with: transcript)
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let previous = noteText
+        let merged = merge(previous, with: trimmed)
         noteText = merged
+        let insertedLength = trimmed.count
+        let insertedStart = previous.isEmpty ? 0 : previous.count + 1
+        highlightRequest = SpeechHighlightRequest(
+            id: UUID(),
+            range: NSRange(location: insertedStart, length: insertedLength)
+        )
     }
 
-    private func applyLiveTranscriptDraft(_ partialText: String) {
-        let trimmed = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func applyLiveTranscriptPartial(_ partial: LiveTranscriptPartial) {
+        guard selectedMode == .liveStreaming else { return }
+
+        if liveSessionID != partial.sessionID {
+            liveSessionID = partial.sessionID
+            liveDraftBaseText = noteText
+            livePreviewText = ""
+            liveReconciler.beginSession(partial.sessionID)
+        }
+
+        liveDebugLog("root_partial window=[\(partial.windowStartTime), \(partial.windowEndTime)] segments=\(partial.segments.count)")
+
+        guard let renderState = liveReconciler.apply(partial) else { return }
+        let preview = renderState.renderedText
+        guard !preview.isEmpty else { return }
+        let acceptedPreview = acceptedLivePreview(from: preview)
+        guard acceptedPreview != livePreviewText else { return }
+        livePreviewText = acceptedPreview
+
+        let updatedNoteText = merge(liveDraftBaseText, with: acceptedPreview)
+        let previous = noteText
+        noteText = updatedNoteText
+        let insertedSuffixLength = max(0, updatedNoteText.count - previous.count)
+        applyHighlightForLatestLiveDelta(
+            in: updatedNoteText,
+            insertedSuffixLength: insertedSuffixLength > 0 ? insertedSuffixLength : acceptedPreview.count
+        )
+    }
+
+    private func commitFinalTranscript(sessionID: UUID, _ finalText: String) {
+        let trimmed = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        if !hasLiveTranscriptDraft {
-            baseNoteTextBeforeLiveDraft = noteText
-            hasLiveTranscriptDraft = true
-            liveAccumulatedTranscript = trimmed
-            lastLivePartialTranscript = trimmed
-            let updatedText = merge(baseNoteTextBeforeLiveDraft, with: liveAccumulatedTranscript)
-            noteText = updatedText
-            liveHighlightRequest = makeLiveHighlightRequest(in: updatedText, appendedChunk: trimmed)
+        if selectedMode != .liveStreaming || liveSessionID == nil {
+            appendTranscript(trimmed)
+            resetLiveDraftState(clearPreview: false)
             return
         }
 
-        let delta = incrementalDelta(previous: lastLivePartialTranscript, current: trimmed)
-        if !delta.isEmpty {
-            if liveAccumulatedTranscript.isEmpty {
-                liveAccumulatedTranscript = delta
-            } else {
-                liveAccumulatedTranscript += " " + delta
-            }
-            let updatedText = merge(baseNoteTextBeforeLiveDraft, with: liveAccumulatedTranscript)
-            noteText = updatedText
-            liveHighlightRequest = makeLiveHighlightRequest(in: updatedText, appendedChunk: delta)
-        }
-        lastLivePartialTranscript = trimmed
-    }
-
-    private func commitFinalTranscript(_ finalText: String) {
-        let trimmed = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if hasLiveTranscriptDraft {
-            noteText = merge(baseNoteTextBeforeLiveDraft, with: trimmed)
-            baseNoteTextBeforeLiveDraft = noteText
-            hasLiveTranscriptDraft = false
-            liveAccumulatedTranscript = ""
-            lastLivePartialTranscript = ""
-            liveHighlightRequest = nil
+        guard sessionID == liveSessionID else {
+            liveDebugLog("drop_final_stale_session")
             return
         }
+        liveDebugLog("final_commit=\"\(trimmed)\"")
 
-        appendTranscript(trimmed)
+        let merged = merge(liveDraftBaseText, with: trimmed)
+        noteText = merged
+        let insertedStart = liveDraftBaseText.isEmpty ? 0 : liveDraftBaseText.count + 1
+        if insertedStart + trimmed.count <= merged.count {
+            highlightRequest = SpeechHighlightRequest(
+                id: UUID(),
+                range: NSRange(location: insertedStart, length: trimmed.count)
+            )
+        }
+        resetLiveDraftState(clearPreview: false)
     }
 
-    private func makeLiveHighlightRequest(in fullText: String, appendedChunk: String) -> LiveHighlightRequest? {
-        let trimmedChunk = appendedChunk.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedChunk.isEmpty else { return nil }
-        let fullNSString = fullText as NSString
-        let chunkNSString = trimmedChunk as NSString
-        guard fullNSString.length >= chunkNSString.length else { return nil }
-        let range = NSRange(location: fullNSString.length - chunkNSString.length, length: chunkNSString.length)
-        return LiveHighlightRequest(range: range)
+    private func resetLiveDraftState(clearPreview: Bool) {
+        _ = clearPreview
+        highlightRequest = nil
+        liveSessionID = nil
+        liveDraftBaseText = ""
+        livePreviewText = ""
+        liveReconciler.reset()
     }
 
-    private func incrementalDelta(previous: String, current: String) -> String {
-        let currentTrimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-        let previousTrimmed = previous.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !currentTrimmed.isEmpty else { return "" }
-        guard !previousTrimmed.isEmpty else { return currentTrimmed }
-        if currentTrimmed == previousTrimmed { return "" }
-
-        if currentTrimmed.hasPrefix(previousTrimmed) {
-            return String(currentTrimmed.dropFirst(previousTrimmed.count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        if previousTrimmed.hasPrefix(currentTrimmed) {
-            return ""
-        }
-
-        let overlap = longestSuffixPrefixOverlap(a: previousTrimmed, b: currentTrimmed)
-        if overlap > 0 {
-            return String(currentTrimmed.dropFirst(overlap))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        return currentTrimmed
+    private func applyHighlightForLatestLiveDelta(in fullText: String, insertedSuffixLength: Int) {
+        guard insertedSuffixLength > 0 else { return }
+        let start = max(0, fullText.count - insertedSuffixLength)
+        highlightRequest = SpeechHighlightRequest(
+            id: UUID(),
+            range: NSRange(location: start, length: insertedSuffixLength)
+        )
     }
 
-    private func longestSuffixPrefixOverlap(a: String, b: String) -> Int {
-        let aChars = Array(a)
-        let bChars = Array(b)
-        let maxLen = min(aChars.count, bChars.count)
-        guard maxLen > 0 else { return 0 }
+    private func acceptedLivePreview(from incoming: String) -> String {
+        let next = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !next.isEmpty else { return livePreviewText }
+        return next
+    }
 
-        for len in stride(from: maxLen, through: 1, by: -1) {
-            let aSuffix = aChars[(aChars.count - len)...]
-            let bPrefix = bChars[0..<len]
-            if Array(aSuffix).elementsEqual(bPrefix) {
-                return len
-            }
-        }
-        return 0
+    private static func defaultSupportedLanguage() -> SpeechToTextManager.SupportedLanguage {
+        let preferred = Locale.preferredLanguages.first?.lowercased() ?? "en"
+        if preferred.hasPrefix("es") { return .spanish }
+        if preferred.hasPrefix("fr") { return .french }
+        return .english
+    }
+
+    private func liveDebugLog(_ message: String) {
+        guard liveDebugLoggingEnabled else { return }
+        print("[LIVE_DEBUG][RootView] \(message)")
     }
 }
 
-private struct LiveHighlightRequest: Equatable {
-    let id = UUID()
+private struct SpeechHighlightRequest: Equatable {
+    let id: UUID
     let range: NSRange
 }
 
 private struct LiveAwareTextView: UIViewRepresentable {
     @Binding var text: String
-    let highlightRequest: LiveHighlightRequest?
+    let highlightRequest: SpeechHighlightRequest?
     let shouldAutoScrollLiveInsertion: Bool
 
     func makeCoordinator() -> Coordinator {
@@ -226,23 +282,23 @@ private struct LiveAwareTextView: UIViewRepresentable {
             uiView.text = text
             uiView.font = .preferredFont(forTextStyle: .body)
             uiView.textColor = .label
+            if shouldAutoScrollLiveInsertion {
+                DispatchQueue.main.async {
+                    let safeOffset = max(0, uiView.contentSize.height - uiView.bounds.height + uiView.adjustedContentInset.bottom)
+                    uiView.setContentOffset(CGPoint(x: 0, y: safeOffset), animated: true)
+                }
+            }
         }
 
-        guard let highlightRequest else { return }
-        guard context.coordinator.lastHandledHighlightID != highlightRequest.id else { return }
-        context.coordinator.lastHandledHighlightID = highlightRequest.id
-        context.coordinator.applyTemporaryHighlight(
-            in: uiView,
-            range: highlightRequest.range,
-            requestID: highlightRequest.id,
-            autoScrollToCenter: shouldAutoScrollLiveInsertion
-        )
+        if let request = highlightRequest, context.coordinator.lastHandledHighlightID != request.id {
+            context.coordinator.lastHandledHighlightID = request.id
+            context.coordinator.applyHighlight(on: uiView, range: request.range)
+        }
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: LiveAwareTextView
         var lastHandledHighlightID: UUID?
-        private var activeHighlightID: UUID?
 
         init(_ parent: LiveAwareTextView) {
             self.parent = parent
@@ -252,70 +308,25 @@ private struct LiveAwareTextView: UIViewRepresentable {
             parent.text = textView.text
         }
 
-        func applyTemporaryHighlight(in textView: UITextView, range: NSRange, requestID: UUID, autoScrollToCenter: Bool) {
-            let fullLength = (textView.text as NSString).length
-            guard fullLength > 0, range.location != NSNotFound, NSMaxRange(range) <= fullLength else { return }
+        func applyHighlight(on textView: UITextView, range: NSRange) {
+            guard range.location >= 0, range.length > 0 else { return }
+            let totalLength = (textView.text as NSString).length
+            guard NSMaxRange(range) <= totalLength else { return }
 
-            activeHighlightID = requestID
-            let selectedRange = textView.selectedRange
-
-            let attributed = NSMutableAttributedString(string: textView.text)
-            let fullRange = NSRange(location: 0, length: attributed.length)
-            attributed.addAttribute(.font, value: UIFont.preferredFont(forTextStyle: .body), range: fullRange)
-            attributed.addAttribute(.foregroundColor, value: UIColor.label, range: fullRange)
-            attributed.addAttribute(.backgroundColor, value: UIColor.clear, range: fullRange)
-            attributed.addAttribute(.backgroundColor, value: UIColor.systemYellow.withAlphaComponent(0.35), range: range)
-
-            textView.attributedText = attributed
-            textView.selectedRange = selectedRange
-
-            if autoScrollToCenter {
-                DispatchQueue.main.async { [weak self, weak textView] in
-                    guard let self, let textView else { return }
-                    self.centerRange(range, in: textView)
-                }
-            }
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self, weak textView] in
-                guard let self, let textView else { return }
-                guard self.activeHighlightID == requestID else { return }
-
-                let latestSelectedRange = textView.selectedRange
-                textView.attributedText = NSAttributedString(
-                    string: textView.text,
-                    attributes: [
-                        .font: UIFont.preferredFont(forTextStyle: .body),
-                        .foregroundColor: UIColor.label
-                    ]
-                )
-                textView.selectedRange = latestSelectedRange
-            }
-        }
-
-        private func centerRange(_ range: NSRange, in textView: UITextView) {
-            textView.layoutIfNeeded()
-            textView.layoutManager.ensureLayout(for: textView.textContainer)
-
-            let insertionIndex = min((textView.text as NSString).length, NSMaxRange(range))
-            guard
-                let insertionPosition = textView.position(from: textView.beginningOfDocument, offset: insertionIndex)
-            else {
-                return
-            }
-
-            // Caret-based centering is more stable than glyph-range bounding boxes
-            // when attributed text is updated rapidly during live streaming.
-            let caretRect = textView.caretRect(for: insertionPosition)
-            let midY = caretRect.midY
-
-            let minOffsetY = -textView.adjustedContentInset.top
-            let maxOffsetY = max(
-                minOffsetY,
-                textView.contentSize.height - textView.bounds.height + textView.adjustedContentInset.bottom
+            textView.textStorage.addAttribute(
+                .backgroundColor,
+                value: UIColor.systemYellow.withAlphaComponent(0.35),
+                range: range
             )
-            let targetOffsetY = min(max(midY - (textView.bounds.height * 0.5), minOffsetY), maxOffsetY)
-            textView.setContentOffset(CGPoint(x: 0, y: targetOffsetY), animated: false)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak textView] in
+                guard let textView else { return }
+                let currentLength = (textView.text as NSString).length
+                guard NSMaxRange(range) <= currentLength else { return }
+                textView.textStorage.removeAttribute(.backgroundColor, range: range)
+            }
         }
+
     }
 }
 

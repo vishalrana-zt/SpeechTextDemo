@@ -61,13 +61,7 @@ struct DownloadScreen: View {
 
     private var regularPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                Image(systemName: "waveform.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(Color.accentColor)
-                Text("Model Setup")
-                    .font(.headline)
-
+            HStack {
                 Spacer()
 
                 if case .downloading(let status) = modelState, displayedProgress(for: status) < 0.995 {
@@ -79,7 +73,7 @@ struct DownloadScreen: View {
 
             switch modelState {
             case .notDownloaded:
-                Text("Download required (~600MB). After setup, transcription works fully offline.")
+                Text("Download required (~500MB). After setup, transcription works fully offline.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Button("Enable Offline Setup", action: onPrimaryActionTapped)
@@ -101,11 +95,11 @@ struct DownloadScreen: View {
                         .foregroundStyle(.secondary)
                 }
 
-            case .loadingModel(let loaded, let total):
+            case .loadingModel:
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("Loading models (\(loaded) of \(total) loaded)...")
+                        Text("Loading model...")
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }

@@ -50,10 +50,23 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
+    enum OperationMode: String, CaseIterable {
+        case liveStreaming
+        case postRecording
+    }
+
     struct DownloadStatus: Equatable {
         let progress: Double
         let downloadedBytes: Int64
         let totalBytes: Int64
+    }
+
+    struct LivePartialResult: Sendable {
+        let text: String
+        let language: SupportedLanguage
+        let windowStartTime: TimeInterval
+        let windowEndTime: TimeInterval
+        let segments: [LiveTranscriptSegment]
     }
 
     enum ModelState: Equatable {
@@ -99,6 +112,7 @@ final class SpeechToTextManager: NSObject {
     private var lastLiveResolvedLanguage: SupportedLanguage?
     private let liveLanguageLockMinimumSeconds: Double = 2.0
     private let liveLanguageLockConfirmationsRequired: Int = 2
+    private var didPrewarmRecordingPath = false
 
     var onSilenceAutoStopTriggered: (() -> Void)?
     var onAudioLevelChange: ((Float) -> Void)?
@@ -178,9 +192,18 @@ final class SpeechToTextManager: NSObject {
     private static let modelSource: ModelSource = .bundled
     private let tinyCDNDownloader = CDNModelDownloader()
     private let smallCDNDownloader = CDNModelDownloader()
+    private var operationMode: OperationMode = .liveStreaming
 
     var isBundledModelSource: Bool {
         Self.modelSource == .bundled
+    }
+
+    func setOperationMode(_ mode: OperationMode) {
+        guard operationMode != mode else { return }
+        operationMode = mode
+        liveWhisperKit = nil
+        finalWhisperKit = nil
+        modelState = .notDownloaded
     }
     
     // Safe to call again on relaunch if a previous download was interrupted —
@@ -188,7 +211,7 @@ final class SpeechToTextManager: NSObject {
     func prepareOnOptIn() async {
         UserDefaults.standard.set(true, forKey: Self.optedInKey)
 
-        if liveWhisperKit != nil, finalWhisperKit != nil {
+        if isActiveModelLoaded {
             modelState = .ready
             return
         }
@@ -207,34 +230,20 @@ final class SpeechToTextManager: NSObject {
         smallDownloadTransfer = nil
 
         do {
-            let tinyModelFolder: URL
-            let smallModelFolder: URL
+            let selectedVariant = activeModelVariant
+            let selectedModelFolder: URL
 
             if Self.modelSource == .cdn {
-                // Both downloads run concurrently — progress callbacks for each
-                // still fire independently and get combined in updateDownloadState(for:transfer:).
-                async let tinyDownload = downloadFromCDN(variant: .tiny)
-                async let smallDownload = downloadFromCDN(variant: .small)
-                (tinyModelFolder, smallModelFolder) = try await (tinyDownload, smallDownload)
+                selectedModelFolder = try await downloadFromCDN(variant: selectedVariant)
             } else if Self.modelSource == .huggingface {
-                async let tinyDownload = WhisperKit.download(variant: Self.tinyModelName, from: Self.modelRepo)
-                async let smallDownload = WhisperKit.download(variant: Self.smallModelName, from: Self.modelRepo)
-                (tinyModelFolder, smallModelFolder) = try await (tinyDownload, smallDownload)
+                selectedModelFolder = try await WhisperKit.download(variant: selectedVariant.modelName, from: Self.modelRepo)
             } else {
                 modelState = .failed("Unsupported model source.")
                 return
             }
 
-            modelState = .loadingModel(loaded: 0, total: 2)
-            liveWhisperKit = try await createWhisperKit(
-                modelFolder: tinyModelFolder.path,
-                profile: .liveTinyFast
-            )
-            modelState = .loadingModel(loaded: 1, total: 2)
-            finalWhisperKit = try await createWhisperKit(
-                modelFolder: smallModelFolder.path,
-                profile: .finalSmallBalanced
-            )
+            modelState = .loadingModel(loaded: 0, total: 1)
+            try await loadModel(variant: selectedVariant, from: selectedModelFolder)
 
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
             modelState = .ready
@@ -246,28 +255,16 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func loadBundledModels() async {
-        guard let tinySourceFolder = bundledModelURL(for: .tiny) else {
-            modelState = .failed("Bundled tiny model '\(ModelVariant.tiny.modelName)' not found in app bundle")
-            return
-        }
-        guard let smallSourceFolder = bundledModelURL(for: .small) else {
-            modelState = .failed("Bundled small model '\(ModelVariant.small.modelName)' not found in app bundle")
+        let selectedVariant = activeModelVariant
+        guard let sourceFolder = bundledModelURL(for: selectedVariant) else {
+            modelState = .failed("Bundled model '\(selectedVariant.modelName)' not found in app bundle")
             return
         }
 
         do {
-            modelState = .loadingModel(loaded: 0, total: 2)
-            let tinyModelFolder = try prepareBundledModelFolder(for: .tiny, sourceFolder: tinySourceFolder)
-            let smallModelFolder = try prepareBundledModelFolder(for: .small, sourceFolder: smallSourceFolder)
-            liveWhisperKit = try await createWhisperKit(
-                modelFolder: tinyModelFolder.path,
-                profile: .liveTinyFast
-            )
-            modelState = .loadingModel(loaded: 1, total: 2)
-            finalWhisperKit = try await createWhisperKit(
-                modelFolder: smallModelFolder.path,
-                profile: .finalSmallBalanced
-            )
+            modelState = .loadingModel(loaded: 0, total: 1)
+            let modelFolder = try prepareBundledModelFolder(for: selectedVariant, sourceFolder: sourceFolder)
+            try await loadModel(variant: selectedVariant, from: modelFolder)
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
             modelState = .ready
         } catch {
@@ -434,22 +431,14 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func loadInstalledModelsIfAvailable() async -> Bool {
-        guard let tinyModelFolder = installedModelFolderURL(for: .tiny),
-              let smallModelFolder = installedModelFolderURL(for: .small) else {
+        let selectedVariant = activeModelVariant
+        guard let modelFolder = installedModelFolderURL(for: selectedVariant) else {
             return false
         }
 
         do {
-            modelState = .loadingModel(loaded: 0, total: 2)
-            liveWhisperKit = try await createWhisperKit(
-                modelFolder: tinyModelFolder.path,
-                profile: .liveTinyFast
-            )
-            modelState = .loadingModel(loaded: 1, total: 2)
-            finalWhisperKit = try await createWhisperKit(
-                modelFolder: smallModelFolder.path,
-                profile: .finalSmallBalanced
-            )
+            modelState = .loadingModel(loaded: 0, total: 1)
+            try await loadModel(variant: selectedVariant, from: modelFolder)
             modelState = .ready
             return true
         } catch {
@@ -526,10 +515,12 @@ final class SpeechToTextManager: NSObject {
                 textDecoderCompute: .cpuAndNeuralEngine
             )
         case .finalSmallBalanced:
+            // Prefer CPU+NE for final decode to avoid GPU command-buffer failures
+            // during stop-time transcription on device.
             preferredCompute = ModelComputeOptions(
-                melCompute: .cpuAndGPU,
-                audioEncoderCompute: .cpuAndGPU,
-                textDecoderCompute: .cpuAndGPU
+                melCompute: .cpuAndNeuralEngine,
+                audioEncoderCompute: .cpuAndNeuralEngine,
+                textDecoderCompute: .cpuAndNeuralEngine
             )
         }
 
@@ -570,6 +561,32 @@ final class SpeechToTextManager: NSObject {
         await withCheckedContinuation { continuation in
             AVAudioApplication.requestRecordPermission { granted in
                 continuation.resume(returning: granted)
+            }
+        }
+    }
+
+    /// Prepares the audio route/session once so the first user tap doesn't pay
+    /// the full activation cost on the main interaction path.
+    func prewarmRecordingPathIfNeeded() {
+        guard !didPrewarmRecordingPath else { return }
+        guard case .ready = modelState else { return }
+        guard AVAudioApplication.shared.recordPermission == .granted else { return }
+        didPrewarmRecordingPath = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let session = AVAudioSession.sharedInstance()
+            do {
+                try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+                try session.setActive(true)
+                // Touching these upfront avoids some first-use graph costs.
+                _ = self.audioEngine.inputNode
+                self.audioEngine.prepare()
+                try session.setActive(false)
+            } catch {
+                // Allow retry if warm-up failed.
+                DispatchQueue.main.async {
+                    self.didPrewarmRecordingPath = false
+                }
             }
         }
     }
@@ -712,7 +729,7 @@ final class SpeechToTextManager: NSObject {
     ///   If provided, transcription is forced to that language.
     func transcribe(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
         if isListening { stopListening() }
-        guard let finalWhisperKit else { throw STTError.notReady }
+        guard let transcriptionWhisperKit = activeTranscriptionWhisperKit else { throw STTError.notReady }
 
         let audio = snapshotAudioBuffer()
 
@@ -727,7 +744,7 @@ final class SpeechToTextManager: NSObject {
             resolvedLanguage = lastLiveResolvedLanguage
             logDetectedLanguage(stage: "final_reuse_live_prior", language: resolvedLanguage)
         } else {
-            resolvedLanguage = try await detectSupportedLanguage(audio: audio, using: finalWhisperKit)
+            resolvedLanguage = try await detectSupportedLanguage(audio: audio, using: transcriptionWhisperKit)
         }
         logDetectedLanguage(stage: "final_transcribe", language: resolvedLanguage)
 
@@ -735,7 +752,7 @@ final class SpeechToTextManager: NSObject {
         options.language = resolvedLanguage.rawValue
         options.detectLanguage = false
 
-        let results = try await finalWhisperKit.transcribe(audioArray: audio, decodeOptions: options)
+        let results = try await transcriptionWhisperKit.transcribe(audioArray: audio, decodeOptions: options)
         guard let first = results.first else { throw STTError.emptyRecording }
 
         let text = first.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -748,7 +765,7 @@ final class SpeechToTextManager: NSObject {
         preferredLanguage: SupportedLanguage? = nil,
         maxAudioSeconds: Double = 8.0,
         minimumAudioSeconds: Double = 0.8
-    ) async throws -> (text: String, language: SupportedLanguage)? {
+    ) async throws -> LivePartialResult? {
         guard let liveWhisperKit else { throw STTError.notReady }
 
         let fullAudio = snapshotAudioBuffer()
@@ -756,6 +773,9 @@ final class SpeechToTextManager: NSObject {
         guard fullAudio.count >= minimumSamples else { return nil }
 
         let audioWindow = recentAudioWindow(fullAudio, maxSeconds: maxAudioSeconds)
+        let windowStartSample = max(0, fullAudio.count - audioWindow.count)
+        let windowStartTime = TimeInterval(windowStartSample) / targetSampleRate
+        let windowEndTime = TimeInterval(fullAudio.count) / targetSampleRate
         let resolvedLanguage: SupportedLanguage
         if let preferredLanguage {
             resolvedLanguage = preferredLanguage
@@ -763,11 +783,11 @@ final class SpeechToTextManager: NSObject {
             resolvedLanguage = liveLockedLanguage
             logDetectedLanguage(stage: "live_locked_reuse", language: resolvedLanguage)
         } else {
-            guard let finalWhisperKit else { throw STTError.notReady }
             let languageLockSamples = Int(targetSampleRate * max(1.0, liveLanguageLockMinimumSeconds))
             if fullAudio.count >= languageLockSamples {
                 let languageWindow = recentAudioWindow(fullAudio, maxSeconds: liveLanguageLockMinimumSeconds + 1.0)
-                if let detectedLanguage = try await detectSupportedLanguageForLiveLock(audio: languageWindow, using: finalWhisperKit) {
+                let languageDetectionWhisperKit = finalWhisperKit ?? liveWhisperKit
+                if let detectedLanguage = try await detectSupportedLanguageForLiveLock(audio: languageWindow, using: languageDetectionWhisperKit) {
                     if pendingLiveLockLanguage == detectedLanguage {
                         pendingLiveLockConfirmations += 1
                     } else {
@@ -806,8 +826,26 @@ final class SpeechToTextManager: NSObject {
 
         let text = first.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
+        let segments = first.segments.compactMap { segment -> LiveTranscriptSegment? in
+            let trimmedText = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedText.isEmpty else { return nil }
+            let absoluteStart = windowStartTime + TimeInterval(segment.start)
+            let absoluteEnd = windowStartTime + TimeInterval(segment.end)
+            guard absoluteEnd > absoluteStart else { return nil }
+            return LiveTranscriptSegment(
+                startTime: absoluteStart,
+                endTime: absoluteEnd,
+                text: trimmedText
+            )
+        }
         lastLiveResolvedLanguage = resolvedLanguage
-        return (text, resolvedLanguage)
+        return LivePartialResult(
+            text: text,
+            language: resolvedLanguage,
+            windowStartTime: windowStartTime,
+            windowEndTime: windowEndTime,
+            segments: segments
+        )
     }
 
     private func snapshotAudioBuffer() -> [Float] {
@@ -927,6 +965,48 @@ final class SpeechToTextManager: NSObject {
         if preferredLocale.hasPrefix("es") { return .spanish }
         if preferredLocale.hasPrefix("fr") { return .french }
         return nil
+    }
+
+    private var activeModelVariant: ModelVariant {
+        switch operationMode {
+        case .liveStreaming:
+            return .tiny
+        case .postRecording:
+            return .small
+        }
+    }
+
+    private var isActiveModelLoaded: Bool {
+        switch operationMode {
+        case .liveStreaming:
+            return liveWhisperKit != nil
+        case .postRecording:
+            return finalWhisperKit != nil
+        }
+    }
+
+    private var activeTranscriptionWhisperKit: WhisperKit? {
+        switch operationMode {
+        case .liveStreaming:
+            return liveWhisperKit
+        case .postRecording:
+            return finalWhisperKit
+        }
+    }
+
+    private func loadModel(variant: ModelVariant, from folder: URL) async throws {
+        switch variant {
+        case .tiny:
+            liveWhisperKit = try await createWhisperKit(
+                modelFolder: folder.path,
+                profile: .liveTinyFast
+            )
+        case .small:
+            finalWhisperKit = try await createWhisperKit(
+                modelFolder: folder.path,
+                profile: .finalSmallBalanced
+            )
+        }
     }
 
     private func logDetectedLanguage(stage: String, language: SupportedLanguage) {
