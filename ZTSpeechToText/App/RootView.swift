@@ -4,6 +4,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct RootView: View {
 
@@ -13,14 +14,17 @@ struct RootView: View {
     @State private var baseNoteTextBeforeLiveDraft = ""
     @State private var liveAccumulatedTranscript = ""
     @State private var lastLivePartialTranscript = ""
-    @FocusState private var isNoteEditorFocused: Bool
+    @State private var liveHighlightRequest: LiveHighlightRequest?
+    @State private var preferredSTTLanguage: SpeechToTextManager.SupportedLanguage? = .english
 
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 16) {
-                TextEditor(text: $noteText)
-                    .font(.body)
-                    .focused($isNoteEditorFocused)
+                LiveAwareTextView(
+                    text: $noteText,
+                    highlightRequest: liveHighlightRequest,
+                    shouldAutoScrollLiveInsertion: hasLiveTranscriptDraft
+                )
                     .padding(4)
                     .background(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -35,7 +39,7 @@ struct RootView: View {
                 Spacer()
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        isNoteEditorFocused = false
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                     }
             }
             .padding()
@@ -52,13 +56,14 @@ struct RootView: View {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("Done") {
-                        isNoteEditorFocused = false
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                     }
                 }
             }
         }
         .speechToTextSheet(
             isPresented: $isSpeechToTextSheetPresented,
+            preferredLanguage: preferredSTTLanguage,
             onLiveTranscriptChanged: { partialText in
                 applyLiveTranscriptDraft(partialText)
             },
@@ -72,6 +77,7 @@ struct RootView: View {
                 baseNoteTextBeforeLiveDraft = noteText
                 liveAccumulatedTranscript = ""
                 lastLivePartialTranscript = ""
+                liveHighlightRequest = nil
             }
         }
     }
@@ -99,7 +105,9 @@ struct RootView: View {
             hasLiveTranscriptDraft = true
             liveAccumulatedTranscript = trimmed
             lastLivePartialTranscript = trimmed
-            noteText = merge(baseNoteTextBeforeLiveDraft, with: liveAccumulatedTranscript)
+            let updatedText = merge(baseNoteTextBeforeLiveDraft, with: liveAccumulatedTranscript)
+            noteText = updatedText
+            liveHighlightRequest = makeLiveHighlightRequest(in: updatedText, appendedChunk: trimmed)
             return
         }
 
@@ -110,7 +118,9 @@ struct RootView: View {
             } else {
                 liveAccumulatedTranscript += " " + delta
             }
-            noteText = merge(baseNoteTextBeforeLiveDraft, with: liveAccumulatedTranscript)
+            let updatedText = merge(baseNoteTextBeforeLiveDraft, with: liveAccumulatedTranscript)
+            noteText = updatedText
+            liveHighlightRequest = makeLiveHighlightRequest(in: updatedText, appendedChunk: delta)
         }
         lastLivePartialTranscript = trimmed
     }
@@ -124,10 +134,21 @@ struct RootView: View {
             hasLiveTranscriptDraft = false
             liveAccumulatedTranscript = ""
             lastLivePartialTranscript = ""
+            liveHighlightRequest = nil
             return
         }
 
         appendTranscript(trimmed)
+    }
+
+    private func makeLiveHighlightRequest(in fullText: String, appendedChunk: String) -> LiveHighlightRequest? {
+        let trimmedChunk = appendedChunk.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedChunk.isEmpty else { return nil }
+        let fullNSString = fullText as NSString
+        let chunkNSString = trimmedChunk as NSString
+        guard fullNSString.length >= chunkNSString.length else { return nil }
+        let range = NSRange(location: fullNSString.length - chunkNSString.length, length: chunkNSString.length)
+        return LiveHighlightRequest(range: range)
     }
 
     private func incrementalDelta(previous: String, current: String) -> String {
@@ -169,6 +190,132 @@ struct RootView: View {
             }
         }
         return 0
+    }
+}
+
+private struct LiveHighlightRequest: Equatable {
+    let id = UUID()
+    let range: NSRange
+}
+
+private struct LiveAwareTextView: UIViewRepresentable {
+    @Binding var text: String
+    let highlightRequest: LiveHighlightRequest?
+    let shouldAutoScrollLiveInsertion: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.delegate = context.coordinator
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.backgroundColor = .clear
+        textView.textColor = .label
+        textView.isScrollEnabled = true
+        textView.alwaysBounceVertical = true
+        textView.keyboardDismissMode = .interactive
+        textView.textContainerInset = UIEdgeInsets(top: 8, left: 4, bottom: 8, right: 4)
+        textView.text = text
+        return textView
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        if uiView.text != text {
+            uiView.text = text
+            uiView.font = .preferredFont(forTextStyle: .body)
+            uiView.textColor = .label
+        }
+
+        guard let highlightRequest else { return }
+        guard context.coordinator.lastHandledHighlightID != highlightRequest.id else { return }
+        context.coordinator.lastHandledHighlightID = highlightRequest.id
+        context.coordinator.applyTemporaryHighlight(
+            in: uiView,
+            range: highlightRequest.range,
+            requestID: highlightRequest.id,
+            autoScrollToCenter: shouldAutoScrollLiveInsertion
+        )
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: LiveAwareTextView
+        var lastHandledHighlightID: UUID?
+        private var activeHighlightID: UUID?
+
+        init(_ parent: LiveAwareTextView) {
+            self.parent = parent
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            parent.text = textView.text
+        }
+
+        func applyTemporaryHighlight(in textView: UITextView, range: NSRange, requestID: UUID, autoScrollToCenter: Bool) {
+            let fullLength = (textView.text as NSString).length
+            guard fullLength > 0, range.location != NSNotFound, NSMaxRange(range) <= fullLength else { return }
+
+            activeHighlightID = requestID
+            let selectedRange = textView.selectedRange
+
+            let attributed = NSMutableAttributedString(string: textView.text)
+            let fullRange = NSRange(location: 0, length: attributed.length)
+            attributed.addAttribute(.font, value: UIFont.preferredFont(forTextStyle: .body), range: fullRange)
+            attributed.addAttribute(.foregroundColor, value: UIColor.label, range: fullRange)
+            attributed.addAttribute(.backgroundColor, value: UIColor.clear, range: fullRange)
+            attributed.addAttribute(.backgroundColor, value: UIColor.systemYellow.withAlphaComponent(0.35), range: range)
+
+            textView.attributedText = attributed
+            textView.selectedRange = selectedRange
+
+            if autoScrollToCenter {
+                DispatchQueue.main.async { [weak self, weak textView] in
+                    guard let self, let textView else { return }
+                    self.centerRange(range, in: textView)
+                }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self, weak textView] in
+                guard let self, let textView else { return }
+                guard self.activeHighlightID == requestID else { return }
+
+                let latestSelectedRange = textView.selectedRange
+                textView.attributedText = NSAttributedString(
+                    string: textView.text,
+                    attributes: [
+                        .font: UIFont.preferredFont(forTextStyle: .body),
+                        .foregroundColor: UIColor.label
+                    ]
+                )
+                textView.selectedRange = latestSelectedRange
+            }
+        }
+
+        private func centerRange(_ range: NSRange, in textView: UITextView) {
+            textView.layoutIfNeeded()
+            textView.layoutManager.ensureLayout(for: textView.textContainer)
+
+            let insertionIndex = min((textView.text as NSString).length, NSMaxRange(range))
+            guard
+                let insertionPosition = textView.position(from: textView.beginningOfDocument, offset: insertionIndex)
+            else {
+                return
+            }
+
+            // Caret-based centering is more stable than glyph-range bounding boxes
+            // when attributed text is updated rapidly during live streaming.
+            let caretRect = textView.caretRect(for: insertionPosition)
+            let midY = caretRect.midY
+
+            let minOffsetY = -textView.adjustedContentInset.top
+            let maxOffsetY = max(
+                minOffsetY,
+                textView.contentSize.height - textView.bounds.height + textView.adjustedContentInset.bottom
+            )
+            let targetOffsetY = min(max(midY - (textView.bounds.height * 0.5), minOffsetY), maxOffsetY)
+            textView.setContentOffset(CGPoint(x: 0, y: targetOffsetY), animated: false)
+        }
     }
 }
 

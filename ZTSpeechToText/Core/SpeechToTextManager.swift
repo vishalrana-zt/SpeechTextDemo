@@ -39,13 +39,13 @@ final class SpeechToTextManager: NSObject {
     enum SupportedLanguage: String, CaseIterable {
         case english = "en"
         case spanish = "es"
-        case french  = "fr-CA"
+        case french  = "fr"
 
         var displayName: String {
             switch self {
             case .english: return "English"
             case .spanish: return "Spanish"
-            case .french:  return "French (Canada)"
+            case .french:  return "French"
             }
         }
     }
@@ -93,6 +93,12 @@ final class SpeechToTextManager: NSObject {
     private let maxRecordingDuration: TimeInterval = 10 * 60
     private var tinyDownloadTransfer: CDNModelDownloader.TransferProgress?
     private var smallDownloadTransfer: CDNModelDownloader.TransferProgress?
+    private var liveLockedLanguage: SupportedLanguage?
+    private var pendingLiveLockLanguage: SupportedLanguage?
+    private var pendingLiveLockConfirmations: Int = 0
+    private var lastLiveResolvedLanguage: SupportedLanguage?
+    private let liveLanguageLockMinimumSeconds: Double = 2.0
+    private let liveLanguageLockConfirmationsRequired: Int = 2
 
     var onSilenceAutoStopTriggered: (() -> Void)?
     var onAudioLevelChange: ((Float) -> Void)?
@@ -164,8 +170,14 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
+    private enum ComputeProfile {
+        case liveTinyFast
+        case finalSmallBalanced
+    }
+
     private static let modelSource: ModelSource = .bundled
-    private let cdnDownloader = CDNModelDownloader()
+    private let tinyCDNDownloader = CDNModelDownloader()
+    private let smallCDNDownloader = CDNModelDownloader()
 
     var isBundledModelSource: Bool {
         Self.modelSource == .bundled
@@ -173,7 +185,6 @@ final class SpeechToTextManager: NSObject {
     
     // Safe to call again on relaunch if a previous download was interrupted —
     // the underlying downloader resumes partial files rather than restarting.
-
     func prepareOnOptIn() async {
         UserDefaults.standard.set(true, forKey: Self.optedInKey)
 
@@ -198,21 +209,33 @@ final class SpeechToTextManager: NSObject {
         do {
             let tinyModelFolder: URL
             let smallModelFolder: URL
+
             if Self.modelSource == .cdn {
-                tinyModelFolder = try await downloadFromCDN(variant: .tiny)
-                smallModelFolder = try await downloadFromCDN(variant: .small)
+                // Both downloads run concurrently — progress callbacks for each
+                // still fire independently and get combined in updateDownloadState(for:transfer:).
+                async let tinyDownload = downloadFromCDN(variant: .tiny)
+                async let smallDownload = downloadFromCDN(variant: .small)
+                (tinyModelFolder, smallModelFolder) = try await (tinyDownload, smallDownload)
             } else if Self.modelSource == .huggingface {
-                tinyModelFolder = try await WhisperKit.download(variant: Self.tinyModelName, from: Self.modelRepo)
-                smallModelFolder = try await WhisperKit.download(variant: Self.smallModelName, from: Self.modelRepo)
+                async let tinyDownload = WhisperKit.download(variant: Self.tinyModelName, from: Self.modelRepo)
+                async let smallDownload = WhisperKit.download(variant: Self.smallModelName, from: Self.modelRepo)
+                (tinyModelFolder, smallModelFolder) = try await (tinyDownload, smallDownload)
             } else {
                 modelState = .failed("Unsupported model source.")
                 return
             }
 
             modelState = .loadingModel(loaded: 0, total: 2)
-            liveWhisperKit = try await createWhisperKit(modelFolder: tinyModelFolder.path)
+            liveWhisperKit = try await createWhisperKit(
+                modelFolder: tinyModelFolder.path,
+                profile: .liveTinyFast
+            )
             modelState = .loadingModel(loaded: 1, total: 2)
-            finalWhisperKit = try await createWhisperKit(modelFolder: smallModelFolder.path)
+            finalWhisperKit = try await createWhisperKit(
+                modelFolder: smallModelFolder.path,
+                profile: .finalSmallBalanced
+            )
+
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
             modelState = .ready
         } catch is CancellationError {
@@ -236,9 +259,15 @@ final class SpeechToTextManager: NSObject {
             modelState = .loadingModel(loaded: 0, total: 2)
             let tinyModelFolder = try prepareBundledModelFolder(for: .tiny, sourceFolder: tinySourceFolder)
             let smallModelFolder = try prepareBundledModelFolder(for: .small, sourceFolder: smallSourceFolder)
-            liveWhisperKit = try await createWhisperKit(modelFolder: tinyModelFolder.path)
+            liveWhisperKit = try await createWhisperKit(
+                modelFolder: tinyModelFolder.path,
+                profile: .liveTinyFast
+            )
             modelState = .loadingModel(loaded: 1, total: 2)
-            finalWhisperKit = try await createWhisperKit(modelFolder: smallModelFolder.path)
+            finalWhisperKit = try await createWhisperKit(
+                modelFolder: smallModelFolder.path,
+                profile: .finalSmallBalanced
+            )
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
             modelState = .ready
         } catch {
@@ -276,15 +305,29 @@ final class SpeechToTextManager: NSObject {
 
     private func installedModelFolderURL(for variant: ModelVariant) -> URL? {
         let fileManager = FileManager.default
-        let destination = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent(variant.installFolderName, isDirectory: true)
+        let baseDir = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
 
-        if isModelFolder(destination, fileManager: fileManager) {
-            return destination
+        // 1. Plain location — where CDN-downloaded models land (see
+        //    destinationFolderURL in CDNModelDownloader), and also where a
+        //    bundled model lands if its files already use clean names.
+        let plainDestination = baseDir.appendingPathComponent(variant.installFolderName, isDirectory: true)
+        if isModelFolder(plainDestination, fileManager: fileManager) {
+            return plainDestination
         }
 
+        // 2. Bundled-prepared location — only relevant for the tiny model when
+        //    modelSource == .bundled, where prepareBundledModelFolder() renames
+        //    the tiny_-prefixed bundle resource files into this folder.
+        let preparedDestination = baseDir.appendingPathComponent("BundledPreparedModels", isDirectory: true)
+            .appendingPathComponent(variant.installFolderName, isDirectory: true)
+        if isModelFolder(preparedDestination, fileManager: fileManager) {
+            return preparedDestination
+        }
+
+        // 3. Fallback — some packaging may nest the model one level deeper
+        //    than expected under the plain location; check its children.
         let children = (try? fileManager.contentsOfDirectory(
-            at: destination,
+            at: plainDestination,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         )) ?? []
@@ -292,6 +335,7 @@ final class SpeechToTextManager: NSObject {
         for child in children where isModelFolder(child, fileManager: fileManager) {
             return child
         }
+
         return nil
     }
 
@@ -355,9 +399,15 @@ final class SpeechToTextManager: NSObject {
             .appendingPathComponent("BundledPreparedModels", isDirectory: true)
         let destination = tempRoot.appendingPathComponent(variant.installFolderName, isDirectory: true)
 
-        if fileManager.fileExists(atPath: destination.path) {
-            try fileManager.removeItem(at: destination)
+        // Skip recreation if a valid copy already exists — this is what lets
+        // Core ML's ANE compile cache actually persist across launches. Without
+        // this check, the destination gets deleted and recopied every single
+        // launch, giving every file a fresh modification time and invalidating
+        // whatever compile cache Core ML had built for it.
+        if isModelFolder(destination, fileManager: fileManager) {
+            return destination
         }
+
         try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
 
         let mappings: [(source: String, target: String)] = [
@@ -391,9 +441,15 @@ final class SpeechToTextManager: NSObject {
 
         do {
             modelState = .loadingModel(loaded: 0, total: 2)
-            liveWhisperKit = try await createWhisperKit(modelFolder: tinyModelFolder.path)
+            liveWhisperKit = try await createWhisperKit(
+                modelFolder: tinyModelFolder.path,
+                profile: .liveTinyFast
+            )
             modelState = .loadingModel(loaded: 1, total: 2)
-            finalWhisperKit = try await createWhisperKit(modelFolder: smallModelFolder.path)
+            finalWhisperKit = try await createWhisperKit(
+                modelFolder: smallModelFolder.path,
+                profile: .finalSmallBalanced
+            )
             modelState = .ready
             return true
         } catch {
@@ -402,7 +458,8 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func downloadFromCDN(variant: ModelVariant) async throws -> URL {
-        try await cdnDownloader.downloadAndUnzip(
+        let downloader = variant == .tiny ? tinyCDNDownloader : smallCDNDownloader
+        return try await downloader.downloadAndUnzip(
             modelZipURL: variant.cdnZipURL,
             installFolderName: variant.installFolderName
         ) { [weak self] transfer in
@@ -459,17 +516,41 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
-    private func createWhisperKit(modelFolder: String) async throws -> WhisperKit {
-        let cpuCompute = ModelComputeOptions(
-            melCompute: .cpuOnly,
-            audioEncoderCompute: .cpuOnly,
-            textDecoderCompute: .cpuOnly
-        )
-        return try await WhisperKit(
-            modelFolder: modelFolder,
-            computeOptions: cpuCompute,
-            verbose: false
-        )
+    private func createWhisperKit(modelFolder: String, profile: ComputeProfile) async throws -> WhisperKit {
+        let preferredCompute: ModelComputeOptions
+        switch profile {
+        case .liveTinyFast:
+            preferredCompute = ModelComputeOptions(
+                melCompute: .cpuAndGPU,
+                audioEncoderCompute: .cpuAndNeuralEngine,
+                textDecoderCompute: .cpuAndNeuralEngine
+            )
+        case .finalSmallBalanced:
+            preferredCompute = ModelComputeOptions(
+                melCompute: .cpuAndGPU,
+                audioEncoderCompute: .cpuAndGPU,
+                textDecoderCompute: .cpuAndGPU
+            )
+        }
+
+        do {
+            return try await WhisperKit(
+                modelFolder: modelFolder,
+                computeOptions: preferredCompute,
+                verbose: false
+            )
+        } catch {
+            let fallbackCompute = ModelComputeOptions(
+                melCompute: .cpuOnly,
+                audioEncoderCompute: .cpuOnly,
+                textDecoderCompute: .cpuOnly
+            )
+            return try await WhisperKit(
+                modelFolder: modelFolder,
+                computeOptions: fallbackCompute,
+                verbose: false
+            )
+        }
     }
 
     private func updateDownloadState(fraction: Double, downloadedBytes: Int64, totalBytes: Int64) {
@@ -506,6 +587,10 @@ final class SpeechToTextManager: NSObject {
         accumulatedSilenceDuration = 0
         accumulatedRecordingDuration = 0
         hasTriggeredAutoStop = false
+        liveLockedLanguage = nil
+        pendingLiveLockLanguage = nil
+        pendingLiveLockConfirmations = 0
+        lastLiveResolvedLanguage = nil
 
         let session = AVAudioSession.sharedInstance()
         do {
@@ -636,9 +721,15 @@ final class SpeechToTextManager: NSObject {
         let resolvedLanguage: SupportedLanguage
         if let preferredLanguage {
             resolvedLanguage = preferredLanguage
+        } else if let liveLockedLanguage {
+            resolvedLanguage = liveLockedLanguage
+        } else if let lastLiveResolvedLanguage {
+            resolvedLanguage = lastLiveResolvedLanguage
+            logDetectedLanguage(stage: "final_reuse_live_prior", language: resolvedLanguage)
         } else {
             resolvedLanguage = try await detectSupportedLanguage(audio: audio, using: finalWhisperKit)
         }
+        logDetectedLanguage(stage: "final_transcribe", language: resolvedLanguage)
 
         var options = DecodingOptions()
         options.language = resolvedLanguage.rawValue
@@ -668,8 +759,42 @@ final class SpeechToTextManager: NSObject {
         let resolvedLanguage: SupportedLanguage
         if let preferredLanguage {
             resolvedLanguage = preferredLanguage
+        } else if let liveLockedLanguage {
+            resolvedLanguage = liveLockedLanguage
+            logDetectedLanguage(stage: "live_locked_reuse", language: resolvedLanguage)
         } else {
-            resolvedLanguage = try await detectSupportedLanguage(audio: audioWindow, using: liveWhisperKit)
+            guard let finalWhisperKit else { throw STTError.notReady }
+            let languageLockSamples = Int(targetSampleRate * max(1.0, liveLanguageLockMinimumSeconds))
+            if fullAudio.count >= languageLockSamples {
+                let languageWindow = recentAudioWindow(fullAudio, maxSeconds: liveLanguageLockMinimumSeconds + 1.0)
+                if let detectedLanguage = try await detectSupportedLanguageForLiveLock(audio: languageWindow, using: finalWhisperKit) {
+                    if pendingLiveLockLanguage == detectedLanguage {
+                        pendingLiveLockConfirmations += 1
+                    } else {
+                        pendingLiveLockLanguage = detectedLanguage
+                        pendingLiveLockConfirmations = 1
+                    }
+
+                    if pendingLiveLockConfirmations >= liveLanguageLockConfirmationsRequired {
+                        liveLockedLanguage = detectedLanguage
+                        resolvedLanguage = detectedLanguage
+                        logDetectedLanguage(stage: "live_lock_from_small", language: detectedLanguage)
+                    } else {
+                        resolvedLanguage = preferredDeviceSupportedLanguage() ?? .english
+                        logDetectedLanguage(stage: "live_lock_waiting_confirmation", language: resolvedLanguage)
+                    }
+                } else {
+                    // Keep candidate state across occasional weak ticks instead of
+                    // resetting instantly; this helps lock language in noisy input.
+                    pendingLiveLockConfirmations = max(0, pendingLiveLockConfirmations - 1)
+                    resolvedLanguage = preferredDeviceSupportedLanguage() ?? .english
+                    logDetectedLanguage(stage: "live_lock_deferred_device_prior", language: resolvedLanguage)
+                }
+            } else {
+                // Before small model locks language, use device preference as a temporary prior.
+                resolvedLanguage = preferredDeviceSupportedLanguage() ?? .english
+                logDetectedLanguage(stage: "live_temporary_device_prior", language: resolvedLanguage)
+            }
         }
 
         var options = DecodingOptions()
@@ -681,6 +806,7 @@ final class SpeechToTextManager: NSObject {
 
         let text = first.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
+        lastLiveResolvedLanguage = resolvedLanguage
         return (text, resolvedLanguage)
     }
 
@@ -699,14 +825,112 @@ final class SpeechToTextManager: NSObject {
     /// Runs Whisper's language-ID pass and picks the best match restricted to
     /// `SupportedLanguage.allCases`, instead of accepting whatever it names freely.
     private func detectSupportedLanguage(audio: [Float], using whisperKit: WhisperKit) async throws -> SupportedLanguage {
-        let (_, langProbs) = try await whisperKit.detectLangauge(audioArray: audio)
+        let probabilities = try await stableSupportedLanguageProbabilities(audio: audio, using: whisperKit)
+        let sorted = probabilities.sorted { $0.value > $1.value }
+        let top = sorted.first
+        let second = sorted.dropFirst().first
+        let topConfidence = top?.value ?? 0
+        let margin = topConfidence - (second?.value ?? 0)
 
-        let best = SupportedLanguage.allCases.max { a, b in
-            (langProbs[a.rawValue] ?? 0) < (langProbs[b.rawValue] ?? 0)
+        // Use device language as a soft prior only when language-ID is ambiguous.
+        if let deviceLanguage = preferredDeviceSupportedLanguage(),
+           let deviceConfidence = probabilities[deviceLanguage] {
+            let weakPrediction = topConfidence < 0.45 || margin < 0.12
+            if weakPrediction, deviceConfidence >= topConfidence * 0.7 {
+                return deviceLanguage
+            }
         }
 
         // Fallback: if language ID genuinely returned nothing for our set
         // (e.g. silence), default to the first supported language rather than crash.
-        return best ?? .english
+        return top?.key ?? preferredDeviceSupportedLanguage() ?? .english
+    }
+
+    /// Builds a more stable final language decision by averaging language-ID
+    /// probabilities over multiple windows instead of trusting one pass.
+    private func stableSupportedLanguageProbabilities(
+        audio: [Float],
+        using whisperKit: WhisperKit
+    ) async throws -> [SupportedLanguage: Double] {
+        let minimumWindowSamples = Int(targetSampleRate * 1.2)
+        guard audio.count >= minimumWindowSamples else {
+            return try await supportedLanguageProbabilities(audio: audio, using: whisperKit)
+        }
+
+        let fullWindow = recentAudioWindow(audio, maxSeconds: 30)
+        let tailWindow = recentAudioWindow(audio, maxSeconds: 10)
+        let headWindow: [Float] = {
+            let maxHeadSamples = Int(targetSampleRate * 10)
+            if audio.count <= maxHeadSamples { return audio }
+            return Array(audio.prefix(maxHeadSamples))
+        }()
+
+        let weightedWindows: [(samples: [Float], weight: Double)] = [
+            (fullWindow, 0.35),
+            (tailWindow, 0.45),
+            (headWindow, 0.20)
+        ]
+
+        var aggregate: [SupportedLanguage: Double] = [:]
+        var totalWeight: Double = 0
+        for (samples, weight) in weightedWindows where samples.count >= minimumWindowSamples {
+            let probabilities = try await supportedLanguageProbabilities(audio: samples, using: whisperKit)
+            for language in SupportedLanguage.allCases {
+                aggregate[language, default: 0] += (probabilities[language] ?? 0) * weight
+            }
+            totalWeight += weight
+        }
+
+        guard totalWeight > 0 else {
+            return try await supportedLanguageProbabilities(audio: audio, using: whisperKit)
+        }
+
+        var normalized: [SupportedLanguage: Double] = [:]
+        for language in SupportedLanguage.allCases {
+            normalized[language] = (aggregate[language] ?? 0) / totalWeight
+        }
+        return normalized
+    }
+
+    private func detectSupportedLanguageForLiveLock(audio: [Float], using whisperKit: WhisperKit) async throws -> SupportedLanguage? {
+        let probabilities = try await supportedLanguageProbabilities(audio: audio, using: whisperKit)
+        let sorted = probabilities.sorted { $0.value > $1.value }
+        guard let top = sorted.first else { return nil }
+        let second = sorted.dropFirst().first?.value ?? 0
+        let confidence = top.value
+        let margin = confidence - second
+
+        // Be stricter before locking language for the session.
+        let minConfidenceToLock: Double = 0.45
+        let minMarginToLock: Double = 0.08
+        guard confidence >= minConfidenceToLock, margin >= minMarginToLock else {
+            return nil
+        }
+        return top.key
+    }
+
+    private func supportedLanguageProbabilities(audio: [Float], using whisperKit: WhisperKit) async throws -> [SupportedLanguage: Double] {
+        let (_, langProbs) = try await whisperKit.detectLangauge(audioArray: audio)
+        var probabilities: [SupportedLanguage: Double] = [:]
+        for language in SupportedLanguage.allCases {
+            probabilities[language] = Double(langProbs[language.rawValue] ?? 0)
+        }
+        return probabilities
+    }
+
+    private func preferredDeviceSupportedLanguage() -> SupportedLanguage? {
+        guard let preferredLocale = Locale.preferredLanguages.first?.lowercased() else {
+            return nil
+        }
+
+        if preferredLocale.hasPrefix("en") { return .english }
+        if preferredLocale.hasPrefix("es") { return .spanish }
+        if preferredLocale.hasPrefix("fr") { return .french }
+        return nil
+    }
+
+    private func logDetectedLanguage(stage: String, language: SupportedLanguage) {
+        _ = stage
+        _ = language
     }
 }

@@ -11,15 +11,27 @@ struct RecordScreen: View {
 
     private let manager = SpeechToTextManager.shared
     private let autoStartOnAppear: Bool
+    private let preferredLanguage: SpeechToTextManager.SupportedLanguage?
     private let onLiveTranscriptChanged: ((String) -> Void)?
     private let onTranscriptReady: ((String) -> Void)?
     private let onProcessingCompleted: (() -> Void)?
     private let minimumRecordingDuration: TimeInterval = 0.45
+    private let blankAudioRegex = try! NSRegularExpression(
+        pattern: #"\[\s*blank_audio\s*\]"#,
+        options: [.caseInsensitive]
+    )
+    private let nonSpeechAnnotationRegex = try! NSRegularExpression(
+        pattern: #"(?:\[[^\]]*(?:music|audio|sound|noise|wind|applause|laughter|silence)[^\]]*\]|\([^\)]*(?:music|audio|sound|noise|wind|applause|laughter|silence)[^\)]*\))"#,
+        options: [.caseInsensitive]
+    )
+    private let multiWhitespaceRegex = try! NSRegularExpression(
+        pattern: #"\s{2,}"#,
+        options: []
+    )
 
     @State private var isListening = false
     @State private var isTranscribing = false
     @State private var transcript = ""
-    @State private var detectedLanguage: SpeechToTextManager.SupportedLanguage?
     @State private var errorMessage: String?
     @State private var recordingStartedAt: Date?
     @State private var lastRecordingDuration: TimeInterval = 0
@@ -31,11 +43,13 @@ struct RecordScreen: View {
 
     init(
         autoStartOnAppear: Bool = false,
+        preferredLanguage: SpeechToTextManager.SupportedLanguage? = nil,
         onLiveTranscriptChanged: ((String) -> Void)? = nil,
         onTranscriptReady: ((String) -> Void)? = nil,
         onProcessingCompleted: (() -> Void)? = nil
     ) {
         self.autoStartOnAppear = autoStartOnAppear
+        self.preferredLanguage = preferredLanguage
         self.onLiveTranscriptChanged = onLiveTranscriptChanged
         self.onTranscriptReady = onTranscriptReady
         self.onProcessingCompleted = onProcessingCompleted
@@ -273,7 +287,6 @@ struct RecordScreen: View {
                 silenceThreshold: 0.003
             )
             transcript = ""
-            detectedLanguage = nil
             lastRecordingDuration = 0
             recordingStartedAt = Date()
             isListening = true
@@ -299,17 +312,19 @@ struct RecordScreen: View {
         defer { isTranscribing = false }
 
         do {
-            let result = try await manager.transcribe()
-            transcript = result.text
-            detectedLanguage = result.language
-            if !result.text.isEmpty {
-                onTranscriptReady?(result.text)
+            let result = try await manager.transcribe(preferredLanguage: preferredLanguage)
+            let cleaned = cleanedTranscript(result.text)
+            guard !cleaned.isEmpty else {
+                errorMessage = "No audio detected for this session."
+                return
             }
+            transcript = cleaned
+            onTranscriptReady?(cleaned)
             onProcessingCompleted?()
         } catch {
             let message = error.localizedDescription
             if message.localizedCaseInsensitiveContains("no audio was captured") {
-                errorMessage = "No speech detected. Try again and speak a bit louder."
+                errorMessage = "No audio detected for this session."
             } else {
                 errorMessage = message
             }
@@ -350,17 +365,17 @@ struct RecordScreen: View {
                     }
 
                     do {
-                        let preferredLanguage = await MainActor.run { detectedLanguage }
                         if let partial = try await manager.transcribePartialCurrentBuffer(
                             preferredLanguage: preferredLanguage,
                             maxAudioSeconds: 8.0,
                             minimumAudioSeconds: 0.8
                         ) {
                             await MainActor.run {
-                                transcript = partial.text
-                                detectedLanguage = partial.language
-                                if isLiveTranscriptionEnabled, isListening, !partial.text.isEmpty {
-                                    onLiveTranscriptChanged?(partial.text)
+                                let cleaned = cleanedTranscript(partial.text)
+                                guard !cleaned.isEmpty else { return }
+                                transcript = cleaned
+                                if isLiveTranscriptionEnabled, isListening {
+                                    onLiveTranscriptChanged?(cleaned)
                                 }
                             }
                         }
@@ -383,6 +398,27 @@ struct RecordScreen: View {
         liveTranscriptionTask?.cancel()
         liveTranscriptionTask = nil
         isLiveDecodeInFlight = false
+    }
+
+    private func cleanedTranscript(_ text: String) -> String {
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        let withoutBlankAudio = blankAudioRegex.stringByReplacingMatches(in: text, options: [], range: fullRange, withTemplate: "")
+        let rangeAfterBlank = NSRange(location: 0, length: (withoutBlankAudio as NSString).length)
+        let withoutNonSpeechTags = nonSpeechAnnotationRegex.stringByReplacingMatches(
+            in: withoutBlankAudio,
+            options: [],
+            range: rangeAfterBlank,
+            withTemplate: ""
+        )
+        let rangeAfterTags = NSRange(location: 0, length: (withoutNonSpeechTags as NSString).length)
+        let normalizedWhitespace = multiWhitespaceRegex.stringByReplacingMatches(
+            in: withoutNonSpeechTags,
+            options: [],
+            range: rangeAfterTags,
+            withTemplate: " "
+        )
+        return normalizedWhitespace.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

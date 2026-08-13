@@ -24,6 +24,7 @@ private struct SpeechToTextFlowSheet: View {
 
     private let manager = SpeechToTextManager.shared
     private let compactDownloadBarPreferenceKey = "SpeechToTextFlowSheet.prefersCompactDownloadBar"
+    let preferredLanguage: SpeechToTextManager.SupportedLanguage?
     let onLiveTranscriptChanged: (String) -> Void
     let onTextReady: (String) -> Void
     let onSetupReady: () -> Void
@@ -99,6 +100,7 @@ private struct SpeechToTextFlowSheet: View {
         if case .ready = modelState, !didStartDownloadInThisSession {
             RecordScreen(
                 autoStartOnAppear: shouldAutoStartRecording,
+                preferredLanguage: preferredLanguage,
                 onLiveTranscriptChanged: { text in
                     onLiveTranscriptChanged(text)
                 },
@@ -241,6 +243,7 @@ private struct SpeechToTextFlowSheet: View {
 private struct SpeechToTextSheetModifier: ViewModifier {
 
     @Binding var isPresented: Bool
+    let preferredLanguage: SpeechToTextManager.SupportedLanguage?
     let onLiveTranscriptChanged: (String) -> Void
     let onTextReady: (String) -> Void
     let onSetupReady: () -> Void
@@ -250,6 +253,7 @@ private struct SpeechToTextSheetModifier: ViewModifier {
             .overlay {
                 if isPresented {
                     SpeechToTextFlowSheet(
+                        preferredLanguage: preferredLanguage,
                         onLiveTranscriptChanged: { text in
                             onLiveTranscriptChanged(text)
                         },
@@ -273,6 +277,7 @@ private struct SpeechToTextSheetModifier: ViewModifier {
 extension View {
     func speechToTextSheet(
         isPresented: Binding<Bool>,
+        preferredLanguage: SpeechToTextManager.SupportedLanguage? = nil,
         onLiveTranscriptChanged: @escaping (String) -> Void = { _ in },
         onTextReady: @escaping (String) -> Void,
         onSetupReady: @escaping () -> Void = {}
@@ -280,6 +285,7 @@ extension View {
         modifier(
             SpeechToTextSheetModifier(
                 isPresented: isPresented,
+                preferredLanguage: preferredLanguage,
                 onLiveTranscriptChanged: onLiveTranscriptChanged,
                 onTextReady: onTextReady,
                 onSetupReady: onSetupReady
