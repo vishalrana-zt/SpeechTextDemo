@@ -31,11 +31,12 @@ struct RootView: View {
 
     @State private var noteText = ""
     @State private var isSpeechToTextSheetPresented = false
-    @State private var highlightRequest: SpeechHighlightRequest?
     @State private var liveSessionID: UUID?
     @State private var liveDraftBaseText = ""
     @State private var livePreviewText = ""
     @State private var liveReconciler = LiveTranscriptReconciler()
+    @State private var lastAppliedLiveWindowEnd: TimeInterval = 0
+    @State private var lastLivePreviewAppliedAt: TimeInterval = 0
     @State private var selectedLanguage: SpeechToTextManager.SupportedLanguage = RootView.defaultSupportedLanguage()
     @State private var selectedMode: CaptureMode = .postRecording
     private let liveDebugLoggingEnabled = true
@@ -61,8 +62,10 @@ struct RootView: View {
 
                 LiveAwareTextView(
                     text: $noteText,
-                    highlightRequest: highlightRequest,
-                    shouldAutoScrollLiveInsertion: selectedMode == .liveStreaming && isSpeechToTextSheetPresented
+                    shouldAutoScrollLiveInsertion: selectedMode == .liveStreaming && isSpeechToTextSheetPresented,
+                    shouldShowLiveCaret: selectedMode == .liveStreaming
+                        && isSpeechToTextSheetPresented
+                        && !livePreviewText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
                     .padding(4)
                     .background(
@@ -147,22 +150,24 @@ struct RootView: View {
         let previous = noteText
         let merged = merge(previous, with: trimmed)
         noteText = merged
-        let insertedLength = trimmed.count
-        let insertedStart = previous.isEmpty ? 0 : previous.count + 1
-        highlightRequest = SpeechHighlightRequest(
-            id: UUID(),
-            range: NSRange(location: insertedStart, length: insertedLength)
-        )
     }
 
     private func applyLiveTranscriptPartial(_ partial: LiveTranscriptPartial) {
         guard selectedMode == .liveStreaming else { return }
+        let applyStartedAt = Date()
 
         if liveSessionID != partial.sessionID {
             liveSessionID = partial.sessionID
             liveDraftBaseText = noteText
             livePreviewText = ""
             liveReconciler.beginSession(partial.sessionID)
+            lastAppliedLiveWindowEnd = 0
+            lastLivePreviewAppliedAt = 0
+        }
+
+        if partial.windowEndTime + 0.001 < lastAppliedLiveWindowEnd {
+            liveDebugLog("drop_stale_partial stale_window_end=\(partial.windowEndTime) last=\(lastAppliedLiveWindowEnd)")
+            return
         }
 
         liveDebugLog("root_partial window=[\(partial.windowStartTime), \(partial.windowEndTime)] segments=\(partial.segments.count)")
@@ -172,16 +177,25 @@ struct RootView: View {
         guard !preview.isEmpty else { return }
         let acceptedPreview = acceptedLivePreview(from: preview)
         guard acceptedPreview != livePreviewText else { return }
+
+        let now = Date().timeIntervalSinceReferenceDate
+        let sinceLastApply = now - lastLivePreviewAppliedAt
+        if sinceLastApply < 0.16 {
+            let delta = abs(acceptedPreview.count - livePreviewText.count)
+            if delta < 18 {
+                liveDebugLog("drop_jitter_partial dt_ms=\(Int(sinceLastApply * 1000)) delta=\(delta)")
+                return
+            }
+        }
         livePreviewText = acceptedPreview
 
         let updatedNoteText = merge(liveDraftBaseText, with: acceptedPreview)
         let previous = noteText
         noteText = updatedNoteText
-        let insertedSuffixLength = max(0, updatedNoteText.count - previous.count)
-        applyHighlightForLatestLiveDelta(
-            in: updatedNoteText,
-            insertedSuffixLength: insertedSuffixLength > 0 ? insertedSuffixLength : acceptedPreview.count
-        )
+        lastAppliedLiveWindowEnd = partial.windowEndTime
+        lastLivePreviewAppliedAt = now
+        _ = previous
+        liveDebugLog("ui_apply_ms=\(Int(Date().timeIntervalSince(applyStartedAt) * 1000))")
     }
 
     private func commitFinalTranscript(sessionID: UUID, _ finalText: String) {
@@ -198,36 +212,22 @@ struct RootView: View {
             liveDebugLog("drop_final_stale_session")
             return
         }
-        liveDebugLog("final_commit=\"\(trimmed)\"")
+        let reconciledFinal = liveReconciler.finalize(sessionID: sessionID, finalText: trimmed) ?? trimmed
+        liveDebugLog("final_commit=\"\(reconciledFinal)\"")
 
-        let merged = merge(liveDraftBaseText, with: trimmed)
+        let merged = merge(liveDraftBaseText, with: reconciledFinal)
         noteText = merged
-        let insertedStart = liveDraftBaseText.isEmpty ? 0 : liveDraftBaseText.count + 1
-        if insertedStart + trimmed.count <= merged.count {
-            highlightRequest = SpeechHighlightRequest(
-                id: UUID(),
-                range: NSRange(location: insertedStart, length: trimmed.count)
-            )
-        }
         resetLiveDraftState(clearPreview: false)
     }
 
     private func resetLiveDraftState(clearPreview: Bool) {
         _ = clearPreview
-        highlightRequest = nil
         liveSessionID = nil
         liveDraftBaseText = ""
         livePreviewText = ""
+        lastAppliedLiveWindowEnd = 0
+        lastLivePreviewAppliedAt = 0
         liveReconciler.reset()
-    }
-
-    private func applyHighlightForLatestLiveDelta(in fullText: String, insertedSuffixLength: Int) {
-        guard insertedSuffixLength > 0 else { return }
-        let start = max(0, fullText.count - insertedSuffixLength)
-        highlightRequest = SpeechHighlightRequest(
-            id: UUID(),
-            range: NSRange(location: start, length: insertedSuffixLength)
-        )
     }
 
     private func acceptedLivePreview(from incoming: String) -> String {
@@ -249,15 +249,10 @@ struct RootView: View {
     }
 }
 
-private struct SpeechHighlightRequest: Equatable {
-    let id: UUID
-    let range: NSRange
-}
-
 private struct LiveAwareTextView: UIViewRepresentable {
     @Binding var text: String
-    let highlightRequest: SpeechHighlightRequest?
     let shouldAutoScrollLiveInsertion: Bool
+    let shouldShowLiveCaret: Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -269,62 +264,150 @@ private struct LiveAwareTextView: UIViewRepresentable {
         textView.font = .preferredFont(forTextStyle: .body)
         textView.backgroundColor = .clear
         textView.textColor = .label
+        textView.tintColor = .systemBlue
         textView.isScrollEnabled = true
         textView.alwaysBounceVertical = true
         textView.keyboardDismissMode = .interactive
         textView.textContainerInset = UIEdgeInsets(top: 8, left: 4, bottom: 8, right: 4)
         textView.text = text
+        context.coordinator.attach(textView: textView)
         return textView
     }
 
     func updateUIView(_ uiView: UITextView, context: Context) {
-        if uiView.text != text {
-            uiView.text = text
-            uiView.font = .preferredFont(forTextStyle: .body)
-            uiView.textColor = .label
-            if shouldAutoScrollLiveInsertion {
-                DispatchQueue.main.async {
-                    let safeOffset = max(0, uiView.contentSize.height - uiView.bounds.height + uiView.adjustedContentInset.bottom)
-                    uiView.setContentOffset(CGPoint(x: 0, y: safeOffset), animated: true)
-                }
-            }
-        }
+        context.coordinator.parent = self
+        context.coordinator.updateLiveMode(shouldAutoScrollLiveInsertion)
+        context.coordinator.updateShouldShowLiveCaret(shouldShowLiveCaret)
+        context.coordinator.updateBaseText(text)
 
-        if let request = highlightRequest, context.coordinator.lastHandledHighlightID != request.id {
-            context.coordinator.lastHandledHighlightID = request.id
-            context.coordinator.applyHighlight(on: uiView, range: request.range)
+        let displayText = context.coordinator.currentDisplayText()
+        if uiView.text != displayText {
+            context.coordinator.applyProgrammaticText(displayText, on: uiView)
+        }
+        uiView.font = .preferredFont(forTextStyle: .body)
+        uiView.textColor = .label
+        uiView.tintColor = shouldAutoScrollLiveInsertion ? .systemRed : .systemBlue
+
+        if shouldAutoScrollLiveInsertion {
+            context.coordinator.scrollToEnd(uiView)
         }
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: LiveAwareTextView
-        var lastHandledHighlightID: UUID?
+        private weak var textView: UITextView?
+        private var caretTimer: Timer?
+        private var liveCaretVisible = false
+        private var isProgrammaticTextChange = false
+        private var baseText = ""
+        private var isLiveMode = false
+        private var shouldShowLiveCaret = false
+        private let liveCaretCharacter = "▌"
 
         init(_ parent: LiveAwareTextView) {
             self.parent = parent
         }
 
-        func textViewDidChange(_ textView: UITextView) {
-            parent.text = textView.text
+        deinit {
+            caretTimer?.invalidate()
         }
 
-        func applyHighlight(on textView: UITextView, range: NSRange) {
-            guard range.location >= 0, range.length > 0 else { return }
-            let totalLength = (textView.text as NSString).length
-            guard NSMaxRange(range) <= totalLength else { return }
+        func attach(textView: UITextView) {
+            self.textView = textView
+        }
 
-            textView.textStorage.addAttribute(
-                .backgroundColor,
-                value: UIColor.systemYellow.withAlphaComponent(0.35),
-                range: range
-            )
+        func updateBaseText(_ text: String) {
+            baseText = text
+        }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak textView] in
-                guard let textView else { return }
-                let currentLength = (textView.text as NSString).length
-                guard NSMaxRange(range) <= currentLength else { return }
-                textView.textStorage.removeAttribute(.backgroundColor, range: range)
+        func updateLiveMode(_ enabled: Bool) {
+            guard isLiveMode != enabled else { return }
+            isLiveMode = enabled
+            if enabled {
+                startCaretTimer()
+            } else {
+                stopCaretTimer()
+                if let textView {
+                    applyProgrammaticText(baseText, on: textView)
+                }
             }
+        }
+
+        func updateShouldShowLiveCaret(_ enabled: Bool) {
+            shouldShowLiveCaret = enabled
+            if let textView {
+                applyProgrammaticText(currentDisplayText(), on: textView)
+                if isLiveMode {
+                    scrollToEnd(textView)
+                }
+            }
+        }
+
+        func currentDisplayText() -> String {
+            guard isLiveMode else { return baseText }
+            guard shouldShowLiveCaret else { return baseText }
+            return liveCaretVisible ? baseText + liveCaretCharacter : baseText
+        }
+
+        func applyProgrammaticText(_ value: String, on textView: UITextView) {
+            isProgrammaticTextChange = true
+            if isLiveMode, shouldShowLiveCaret, value.hasSuffix(liveCaretCharacter) {
+                let bodyText = String(value.dropLast(liveCaretCharacter.count))
+                let bodyAttributes: [NSAttributedString.Key: Any] = [
+                    .font: textView.font ?? UIFont.preferredFont(forTextStyle: .body),
+                    .foregroundColor: UIColor.label
+                ]
+                let caretAttributes: [NSAttributedString.Key: Any] = [
+                    .font: textView.font ?? UIFont.preferredFont(forTextStyle: .body),
+                    .foregroundColor: UIColor.systemRed
+                ]
+                let rendered = NSMutableAttributedString(string: bodyText, attributes: bodyAttributes)
+                rendered.append(NSAttributedString(string: liveCaretCharacter, attributes: caretAttributes))
+                textView.attributedText = rendered
+            } else {
+                textView.attributedText = nil
+                textView.text = value
+                textView.textColor = .label
+            }
+            isProgrammaticTextChange = false
+        }
+
+        func scrollToEnd(_ textView: UITextView) {
+            let end = (textView.text as NSString).length
+            textView.selectedRange = NSRange(location: end, length: 0)
+            textView.layoutIfNeeded()
+            if end > 0 {
+                textView.scrollRangeToVisible(NSRange(location: end - 1, length: 1))
+            } else {
+                textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+            }
+            let safeOffset = max(0, textView.contentSize.height - textView.bounds.height + textView.adjustedContentInset.bottom)
+            textView.setContentOffset(CGPoint(x: 0, y: safeOffset), animated: false)
+        }
+
+        private func startCaretTimer() {
+            caretTimer?.invalidate()
+            liveCaretVisible = true
+            caretTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
+                guard let self, self.isLiveMode, let textView else { return }
+                self.liveCaretVisible.toggle()
+                self.applyProgrammaticText(self.currentDisplayText(), on: textView)
+                self.scrollToEnd(textView)
+            }
+            if let caretTimer {
+                RunLoop.main.add(caretTimer, forMode: .common)
+            }
+        }
+
+        private func stopCaretTimer() {
+            caretTimer?.invalidate()
+            caretTimer = nil
+            liveCaretVisible = false
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            guard !isProgrammaticTextChange else { return }
+            parent.text = textView.text
         }
 
     }

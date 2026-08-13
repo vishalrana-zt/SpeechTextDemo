@@ -113,6 +113,39 @@ final class SpeechToTextManager: NSObject {
     private let liveLanguageLockMinimumSeconds: Double = 2.0
     private let liveLanguageLockConfirmationsRequired: Int = 2
     private var didPrewarmRecordingPath = false
+    private var didPrewarmLiveDecode = false
+    private var isPrewarmingSmallModel = false
+    private actor LiveDecodeCoordinator {
+        private var isInFlight = false
+        private var lastStart: Date?
+        private var hasEmittedText = false
+
+        func reset() {
+            isInFlight = false
+            lastStart = nil
+            hasEmittedText = false
+        }
+
+        func markTextEmitted() {
+            hasEmittedText = true
+        }
+
+        func tryBegin(now: Date) -> Bool {
+            guard !isInFlight else { return false }
+            let minInterval = hasEmittedText ? 0.45 : 0.20
+            if let lastStart, now.timeIntervalSince(lastStart) < minInterval {
+                return false
+            }
+            isInFlight = true
+            self.lastStart = now
+            return true
+        }
+
+        func end() {
+            isInFlight = false
+        }
+    }
+    private let liveDecodeCoordinator = LiveDecodeCoordinator()
 
     var onSilenceAutoStopTriggered: (() -> Void)?
     var onAudioLevelChange: ((Float) -> Void)?
@@ -515,12 +548,14 @@ final class SpeechToTextManager: NSObject {
                 textDecoderCompute: .cpuAndNeuralEngine
             )
         case .finalSmallBalanced:
-            // Prefer CPU+NE for final decode to avoid GPU command-buffer failures
-            // during stop-time transcription on device.
+            // Force CPU-only for final Small decode. On some devices/OS states,
+            // ANE compilation can fail at stop-time with:
+            // MILCompilerForANE ... "Couldn't communicate with a helper application".
+            // CPU-only is slower but significantly more reliable for completion.
             preferredCompute = ModelComputeOptions(
-                melCompute: .cpuAndNeuralEngine,
-                audioEncoderCompute: .cpuAndNeuralEngine,
-                textDecoderCompute: .cpuAndNeuralEngine
+                melCompute: .cpuOnly,
+                audioEncoderCompute: .cpuOnly,
+                textDecoderCompute: .cpuOnly
             )
         }
 
@@ -591,6 +626,30 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
+    /// Best-effort warmup for the Tiny live decoder to reduce the first partial decode cost.
+    func prewarmLiveDecodeIfNeeded() {
+        guard !didPrewarmLiveDecode else { return }
+        guard let liveWhisperKit else { return }
+        didPrewarmLiveDecode = true
+
+        Task(priority: .utility) {
+            do {
+                var options = DecodingOptions()
+                options.language = SupportedLanguage.english.rawValue
+                options.detectLanguage = false
+                let silentAudio = Array(repeating: Float.zero, count: Int(targetSampleRate * 0.5))
+                _ = try await liveWhisperKit.transcribe(audioArray: silentAudio, decodeOptions: options)
+#if DEBUG
+                print("[LIVE_DEBUG][SpeechToTextManager] prewarm_live_decode_ready")
+#endif
+            } catch {
+#if DEBUG
+                print("[LIVE_DEBUG][SpeechToTextManager] prewarm_live_decode_failed error=\"\(error.localizedDescription)\"")
+#endif
+            }
+        }
+    }
+
     func startListening(
         autoStopOnSilence: Bool = false,
         silenceDuration: TimeInterval = 1.0,
@@ -608,6 +667,9 @@ final class SpeechToTextManager: NSObject {
         pendingLiveLockLanguage = nil
         pendingLiveLockConfirmations = 0
         lastLiveResolvedLanguage = nil
+        Task(priority: .utility) { [liveDecodeCoordinator] in
+            await liveDecodeCoordinator.reset()
+        }
 
         let session = AVAudioSession.sharedInstance()
         do {
@@ -720,29 +782,42 @@ final class SpeechToTextManager: NSObject {
         accumulatedSilenceDuration = 0
         accumulatedRecordingDuration = 0
         hasTriggeredAutoStop = false
+        Task(priority: .utility) { [liveDecodeCoordinator] in
+            await liveDecodeCoordinator.reset()
+        }
     }
 
     // MARK: - Step 3: Transcription
 
-    /// Stops listening (if active) and returns transcript text plus the language used.
-    /// - Parameter preferredLanguage: If nil, language is auto-detected from audio.
-    ///   If provided, transcription is forced to that language.
+    /// Stops listening (if active) and returns transcript text plus language used.
+    /// In live-streaming mode, this final decode is performed with the Small model
+    /// for higher post-recording accuracy.
     func transcribe(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
+#if DEBUG
+        print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase start")
+#endif
         if isListening { stopListening() }
-        guard let transcriptionWhisperKit = activeTranscriptionWhisperKit else { throw STTError.notReady }
 
         let audio = snapshotAudioBuffer()
-
         guard !audio.isEmpty else { throw STTError.emptyRecording }
+
+        let startedAt = Date()
+#if DEBUG
+        print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase ensure_model_start")
+#endif
+        let (transcriptionWhisperKit, modelVariantUsed, shouldReleaseAfterDecode) = try await finalTranscriptionWhisperKit()
+#if DEBUG
+        print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase model_ready model=\(modelVariantUsed.modelName)")
+#endif
+        defer {
+            if shouldReleaseAfterDecode {
+                finalWhisperKit = nil
+            }
+        }
 
         let resolvedLanguage: SupportedLanguage
         if let preferredLanguage {
             resolvedLanguage = preferredLanguage
-        } else if let liveLockedLanguage {
-            resolvedLanguage = liveLockedLanguage
-        } else if let lastLiveResolvedLanguage {
-            resolvedLanguage = lastLiveResolvedLanguage
-            logDetectedLanguage(stage: "final_reuse_live_prior", language: resolvedLanguage)
         } else {
             resolvedLanguage = try await detectSupportedLanguage(audio: audio, using: transcriptionWhisperKit)
         }
@@ -752,10 +827,24 @@ final class SpeechToTextManager: NSObject {
         options.language = resolvedLanguage.rawValue
         options.detectLanguage = false
 
+#if DEBUG
+        print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase decode_start lang=\(resolvedLanguage.rawValue)")
+#endif
         let results = try await transcriptionWhisperKit.transcribe(audioArray: audio, decodeOptions: options)
-        guard let first = results.first else { throw STTError.emptyRecording }
+        guard !results.isEmpty else { throw STTError.emptyRecording }
 
-        let text = first.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // WhisperKit may return multiple chunk-level results for longer recordings.
+        // Combine all chunk texts to avoid dropping earlier parts of the recording.
+        let text = results
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+#if DEBUG
+        print(
+            "[LIVE_DEBUG][SpeechToTextManager] final_decode model=\(modelVariantUsed.modelName) audio_s=\(String(format: "%.2f", Double(audio.count) / targetSampleRate)) latency_ms=\(Int(Date().timeIntervalSince(startedAt) * 1000))"
+        )
+#endif
         return (text, resolvedLanguage)
     }
 
@@ -767,7 +856,19 @@ final class SpeechToTextManager: NSObject {
         minimumAudioSeconds: Double = 0.8
     ) async throws -> LivePartialResult? {
         guard let liveWhisperKit else { throw STTError.notReady }
+        guard await beginLivePartialDecodeIfPossible() else {
+#if DEBUG
+            print("[LIVE_DEBUG][SpeechToTextManager] partial_decode_skip reason=busy")
+#endif
+            return nil
+        }
+        defer {
+            Task(priority: .utility) { [liveDecodeCoordinator] in
+                await liveDecodeCoordinator.end()
+            }
+        }
 
+        let decodeStartedAt = Date()
         let fullAudio = snapshotAudioBuffer()
         let minimumSamples = Int(targetSampleRate * max(0.2, minimumAudioSeconds))
         guard fullAudio.count >= minimumSamples else { return nil }
@@ -786,8 +887,9 @@ final class SpeechToTextManager: NSObject {
             let languageLockSamples = Int(targetSampleRate * max(1.0, liveLanguageLockMinimumSeconds))
             if fullAudio.count >= languageLockSamples {
                 let languageWindow = recentAudioWindow(fullAudio, maxSeconds: liveLanguageLockMinimumSeconds + 1.0)
-                let languageDetectionWhisperKit = finalWhisperKit ?? liveWhisperKit
-                if let detectedLanguage = try await detectSupportedLanguageForLiveLock(audio: languageWindow, using: languageDetectionWhisperKit) {
+                // Keep live-language detection on the Tiny engine so we don't contend
+                // with stop-time Small finalization on the same model instance.
+                if let detectedLanguage = try await detectSupportedLanguageForLiveLock(audio: languageWindow, using: liveWhisperKit) {
                     if pendingLiveLockLanguage == detectedLanguage {
                         pendingLiveLockConfirmations += 1
                     } else {
@@ -821,24 +923,58 @@ final class SpeechToTextManager: NSObject {
         options.language = resolvedLanguage.rawValue
         options.detectLanguage = false
 
+#if DEBUG
+        print(
+            "[LIVE_DEBUG][SpeechToTextManager] partial_decode_start full_audio_s=\(String(format: "%.2f", Double(fullAudio.count) / targetSampleRate)) window_s=\(String(format: "%.2f", Double(audioWindow.count) / targetSampleRate)) lang=\(resolvedLanguage.rawValue)"
+        )
+#endif
         let results = try await liveWhisperKit.transcribe(audioArray: audioWindow, decodeOptions: options)
-        guard let first = results.first else { return nil }
+        guard !results.isEmpty else { return nil }
 
-        let text = first.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // For longer/complex windows WhisperKit can return multiple chunk results.
+        // Combine all chunk texts to avoid dropping live content.
+        let text = results
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        let segments = first.segments.compactMap { segment -> LiveTranscriptSegment? in
-            let trimmedText = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedText.isEmpty else { return nil }
-            let absoluteStart = windowStartTime + TimeInterval(segment.start)
-            let absoluteEnd = windowStartTime + TimeInterval(segment.end)
-            guard absoluteEnd > absoluteStart else { return nil }
-            return LiveTranscriptSegment(
-                startTime: absoluteStart,
-                endTime: absoluteEnd,
-                text: trimmedText
-            )
+
+        var segments: [LiveTranscriptSegment] = results.flatMap { result in
+            result.segments.compactMap { segment -> LiveTranscriptSegment? in
+                let trimmedText = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedText.isEmpty else { return nil }
+                let absoluteStart = windowStartTime + TimeInterval(segment.start)
+                let absoluteEnd = windowStartTime + TimeInterval(segment.end)
+                guard absoluteEnd > absoluteStart else { return nil }
+                return LiveTranscriptSegment(
+                    startTime: absoluteStart,
+                    endTime: absoluteEnd,
+                    text: trimmedText
+                )
+            }
         }
+        if segments.isEmpty {
+            segments = [
+                LiveTranscriptSegment(
+                    startTime: windowStartTime,
+                    endTime: windowEndTime,
+                    text: text
+                )
+            ]
+        } else {
+            segments.sort {
+                if $0.startTime == $1.startTime { return $0.endTime < $1.endTime }
+                return $0.startTime < $1.startTime
+            }
+        }
+        await liveDecodeCoordinator.markTextEmitted()
         lastLiveResolvedLanguage = resolvedLanguage
+#if DEBUG
+        print(
+            "[LIVE_DEBUG][SpeechToTextManager] partial_decode_done latency_ms=\(Int(Date().timeIntervalSince(decodeStartedAt) * 1000)) text_chars=\(text.count) segments=\(segments.count)"
+        )
+#endif
         return LivePartialResult(
             text: text,
             language: resolvedLanguage,
@@ -848,10 +984,21 @@ final class SpeechToTextManager: NSObject {
         )
     }
 
+    private func beginLivePartialDecodeIfPossible() async -> Bool {
+        await liveDecodeCoordinator.tryBegin(now: Date())
+    }
+
     private func snapshotAudioBuffer() -> [Float] {
         bufferLock.withLock {
             sampleBuffer
         }
+    }
+
+    /// Current captured audio duration while recording.
+    /// Used by live UI scheduler to avoid ultra-early partial decode churn.
+    func currentBufferedAudioSeconds() -> Double {
+        let samples = bufferLock.withLock { sampleBuffer.count }
+        return Double(samples) / targetSampleRate
     }
 
     private func recentAudioWindow(_ audio: [Float], maxSeconds: Double) -> [Float] {
@@ -991,6 +1138,76 @@ final class SpeechToTextManager: NSObject {
             return liveWhisperKit
         case .postRecording:
             return finalWhisperKit
+        }
+    }
+
+    private func finalTranscriptionWhisperKit() async throws -> (whisper: WhisperKit, model: ModelVariant, releaseAfterDecode: Bool) {
+        switch operationMode {
+        case .liveStreaming:
+            let small = try await ensureModelLoaded(for: .small)
+            // Keep Small cached after first load to avoid stop-time hangs on subsequent sessions.
+            return (small, .small, false)
+        case .postRecording:
+            let small = try await ensureModelLoaded(for: .small)
+            return (small, .small, false)
+        }
+    }
+
+    private func ensureModelLoaded(for variant: ModelVariant) async throws -> WhisperKit {
+        switch variant {
+        case .tiny:
+            if let liveWhisperKit { return liveWhisperKit }
+        case .small:
+            if let finalWhisperKit { return finalWhisperKit }
+        }
+
+        let modelFolder: URL
+        if let installed = installedModelFolderURL(for: variant) {
+            modelFolder = installed
+        } else if Self.modelSource == .bundled {
+            guard let sourceFolder = bundledModelURL(for: variant) else {
+                throw STTError.notReady
+            }
+            modelFolder = try prepareBundledModelFolder(for: variant, sourceFolder: sourceFolder)
+        } else {
+            modelFolder = try await downloadFromCDN(variant: variant)
+        }
+
+        try await loadModel(variant: variant, from: modelFolder)
+
+        switch variant {
+        case .tiny:
+            guard let liveWhisperKit else { throw STTError.notReady }
+            return liveWhisperKit
+        case .small:
+            guard let finalWhisperKit else { throw STTError.notReady }
+            return finalWhisperKit
+        }
+    }
+
+    /// Best-effort background warmup to reduce first stop-time latency in live mode.
+    func prewarmSmallFinalModelIfNeeded() {
+        if isLiveTranscriptionEnabled {
+#if DEBUG
+            print("[LIVE_DEBUG][SpeechToTextManager] prewarm_small_skipped reason=live_mode_on")
+#endif
+            return
+        }
+        guard !isPrewarmingSmallModel, finalWhisperKit == nil else { return }
+        isPrewarmingSmallModel = true
+        Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            defer { self.isPrewarmingSmallModel = false }
+            do {
+                _ = try await self.ensureModelLoaded(for: .small)
+#if DEBUG
+                print("[LIVE_DEBUG][SpeechToTextManager] prewarm_small_ready")
+#endif
+            } catch {
+#if DEBUG
+                print("[LIVE_DEBUG][SpeechToTextManager] prewarm_small_failed error=\"\(error.localizedDescription)\"")
+#endif
+            }
         }
     }
 
