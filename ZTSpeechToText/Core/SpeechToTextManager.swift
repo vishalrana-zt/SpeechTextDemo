@@ -104,8 +104,8 @@ final class SpeechToTextManager: NSObject {
     private var accumulatedRecordingDuration: TimeInterval = 0
     private var hasTriggeredAutoStop = false
     private let maxRecordingDuration: TimeInterval = 10 * 60
-    private var tinyDownloadTransfer: CDNModelDownloader.TransferProgress?
-    private var smallDownloadTransfer: CDNModelDownloader.TransferProgress?
+    private let prepareTaskLock = NSLock()
+    private var inFlightPrepareTasks: [ModelVariant: Task<Void, Never>] = [:]
     private var liveLockedLanguage: SupportedLanguage?
     private var pendingLiveLockLanguage: SupportedLanguage?
     private var pendingLiveLockConfirmations: Int = 0
@@ -162,7 +162,7 @@ final class SpeechToTextManager: NSObject {
     /// True once the model is downloaded AND loaded into memory — the only
     /// state in which recording/transcription is actually usable.
     var isReady: Bool {
-        if case .ready = modelState { return true }
+        if case .ready = resolvedModelState(for: activeModelVariant) { return true }
         return false
     }
 
@@ -191,7 +191,7 @@ final class SpeechToTextManager: NSObject {
         case huggingface   // HuggingFace hub
     }
 
-    private enum ModelVariant {
+    private enum ModelVariant: CaseIterable {
         case tiny
         case small
 
@@ -222,86 +222,108 @@ final class SpeechToTextManager: NSObject {
         case finalSmallBalanced
     }
 
-    private static let modelSource: ModelSource = .bundled
+    private static let modelSource: ModelSource = .cdn
     private let tinyCDNDownloader = CDNModelDownloader()
     private let smallCDNDownloader = CDNModelDownloader()
     private var operationMode: OperationMode = .liveStreaming
+    private var modelStateByVariant: [ModelVariant: ModelState] = [
+        .tiny: .notDownloaded,
+        .small: .notDownloaded
+    ]
 
     var isBundledModelSource: Bool {
         Self.modelSource == .bundled
     }
 
+    func modelState(for mode: OperationMode) -> ModelState {
+        let variant = modelVariant(for: mode)
+        return resolvedModelState(for: variant)
+    }
+
     func setOperationMode(_ mode: OperationMode) {
         guard operationMode != mode else { return }
         operationMode = mode
-        liveWhisperKit = nil
-        finalWhisperKit = nil
-        modelState = .notDownloaded
+        modelState = modelState(for: mode)
     }
     
     // Safe to call again on relaunch if a previous download was interrupted —
     // the underlying downloader resumes partial files rather than restarting.
     func prepareOnOptIn() async {
+        await prepareOnOptIn(for: activeModelVariant)
+    }
+
+    private func prepareOnOptIn(for variant: ModelVariant) async {
         UserDefaults.standard.set(true, forKey: Self.optedInKey)
 
-        if isActiveModelLoaded {
-            modelState = .ready
+        if let existingTask = existingPrepareTask(for: variant) {
+            await existingTask.value
             return
         }
 
-        if await loadInstalledModelsIfAvailable() {
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.runPrepareOnOptIn(for: variant)
+        }
+        setPrepareTask(task, for: variant)
+        await task.value
+        clearPrepareTask(for: variant)
+    }
+
+    private func runPrepareOnOptIn(for variant: ModelVariant) async {
+        if isModelLoaded(for: variant) {
+            publishModelState(.ready, for: variant)
+            return
+        }
+
+        if await loadInstalledModelsIfAvailable(for: variant) {
             return
         }
 
         if Self.modelSource == .bundled {
-            await loadBundledModels()
+            await loadBundledModels(for: variant)
             return
         }
 
-        modelState = .downloading(DownloadStatus(progress: 0, downloadedBytes: 0, totalBytes: 0))
-        tinyDownloadTransfer = nil
-        smallDownloadTransfer = nil
+        publishModelState(.downloading(DownloadStatus(progress: 0, downloadedBytes: 0, totalBytes: 0)), for: variant)
 
         do {
-            let selectedVariant = activeModelVariant
             let selectedModelFolder: URL
 
             if Self.modelSource == .cdn {
-                selectedModelFolder = try await downloadFromCDN(variant: selectedVariant)
+                selectedModelFolder = try await downloadFromCDN(variant: variant)
             } else if Self.modelSource == .huggingface {
-                selectedModelFolder = try await WhisperKit.download(variant: selectedVariant.modelName, from: Self.modelRepo)
+                selectedModelFolder = try await WhisperKit.download(variant: variant.modelName, from: Self.modelRepo)
             } else {
-                modelState = .failed("Unsupported model source.")
+                publishModelState(.failed("Unsupported model source."), for: variant)
                 return
             }
 
-            modelState = .loadingModel(loaded: 0, total: 1)
-            try await loadModel(variant: selectedVariant, from: selectedModelFolder)
+            publishModelState(.loadingModel(loaded: 0, total: 1), for: variant)
+            try await loadModelWithRetry(variant: variant, from: selectedModelFolder)
 
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
-            modelState = .ready
+            publishModelState(.ready, for: variant)
         } catch is CancellationError {
-            modelState = .failed("Download cancelled. Tap Retry to resume.")
+            publishModelState(.failed("Download cancelled. Tap Retry to resume."), for: variant)
         } catch {
-            modelState = .failed(error.localizedDescription)
+            publishModelState(.failed(error.localizedDescription), for: variant)
         }
     }
 
-    private func loadBundledModels() async {
-        let selectedVariant = activeModelVariant
-        guard let sourceFolder = bundledModelURL(for: selectedVariant) else {
-            modelState = .failed("Bundled model '\(selectedVariant.modelName)' not found in app bundle")
+    private func loadBundledModels(for variant: ModelVariant) async {
+        guard let sourceFolder = bundledModelURL(for: variant) else {
+            publishModelState(.failed("Bundled model '\(variant.modelName)' not found in app bundle"), for: variant)
             return
         }
 
         do {
-            modelState = .loadingModel(loaded: 0, total: 1)
-            let modelFolder = try prepareBundledModelFolder(for: selectedVariant, sourceFolder: sourceFolder)
-            try await loadModel(variant: selectedVariant, from: modelFolder)
+            publishModelState(.loadingModel(loaded: 0, total: 1), for: variant)
+            let modelFolder = try prepareBundledModelFolder(for: variant, sourceFolder: sourceFolder)
+            try await loadModelWithRetry(variant: variant, from: modelFolder)
             UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
-            modelState = .ready
+            publishModelState(.ready, for: variant)
         } catch {
-            modelState = .failed(error.localizedDescription)
+            publishModelState(.failed(error.localizedDescription), for: variant)
         }
     }
 
@@ -312,7 +334,7 @@ final class SpeechToTextManager: NSObject {
     ///   resumes the download automatically, UI should show the progress screen
     func restoreIfAlreadyDownloaded() async {
         guard hasOptedIn else { return }
-        await prepareOnOptIn()
+        await prepareOnOptIn(for: activeModelVariant)
     }
 
     /// Call this at any entry point where the user tries to use the feature
@@ -320,15 +342,17 @@ final class SpeechToTextManager: NSObject {
     /// if false, the caller should navigate to / show the download-progress UI
     /// instead of proceeding, and resume the download if it isn't already running.
     func gateFeatureUsage() async -> Bool {
-        if isReady { return true }
-        if hasOptedIn, case .downloading = modelState {
+        let activeVariant = activeModelVariant
+        let currentState = resolvedModelState(for: activeVariant)
+        if case .ready = currentState { return true }
+        if hasOptedIn, case .downloading = currentState {
             return false // already downloading, just show progress UI
         }
-        if hasOptedIn, case .loadingModel = modelState {
+        if hasOptedIn, case .loadingModel = currentState {
             return false // model downloaded, now being loaded into memory
         }
         if hasOptedIn {
-            await prepareOnOptIn() // opted in earlier, download never finished/started this session
+            await prepareOnOptIn(for: activeVariant) // opted in earlier, download never finished/started this session
         }
         return false
     }
@@ -463,16 +487,15 @@ final class SpeechToTextManager: NSObject {
         return destination
     }
 
-    private func loadInstalledModelsIfAvailable() async -> Bool {
-        let selectedVariant = activeModelVariant
-        guard let modelFolder = installedModelFolderURL(for: selectedVariant) else {
+    private func loadInstalledModelsIfAvailable(for variant: ModelVariant) async -> Bool {
+        guard let modelFolder = installedModelFolderURL(for: variant) else {
             return false
         }
 
         do {
-            modelState = .loadingModel(loaded: 0, total: 1)
-            try await loadModel(variant: selectedVariant, from: modelFolder)
-            modelState = .ready
+            publishModelState(.loadingModel(loaded: 0, total: 1), for: variant)
+            try await loadModelWithRetry(variant: variant, from: modelFolder)
+            publishModelState(.ready, for: variant)
             return true
         } catch {
             return false
@@ -490,33 +513,11 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func updateDownloadState(for variant: ModelVariant, transfer: CDNModelDownloader.TransferProgress) {
-        switch variant {
-        case .tiny:
-            tinyDownloadTransfer = transfer
-        case .small:
-            smallDownloadTransfer = transfer
-        }
-
-        let tinyDownloaded = tinyDownloadTransfer?.downloadedBytes ?? 0
-        let smallDownloaded = smallDownloadTransfer?.downloadedBytes ?? 0
-        let tinyTotal = tinyDownloadTransfer?.totalBytes ?? 0
-        let smallTotal = smallDownloadTransfer?.totalBytes ?? 0
-
-        let combinedDownloaded = max(0, tinyDownloaded + smallDownloaded)
-        let combinedTotal = max(0, tinyTotal + smallTotal)
-        let combinedFraction: Double
-        if combinedTotal > 0 {
-            combinedFraction = Double(combinedDownloaded) / Double(combinedTotal)
-        } else {
-            let tinyFraction = tinyDownloadTransfer?.fraction ?? 0
-            let smallFraction = smallDownloadTransfer?.fraction ?? 0
-            combinedFraction = (tinyFraction + smallFraction) * 0.5
-        }
-
         updateDownloadState(
-            fraction: combinedFraction,
-            downloadedBytes: combinedDownloaded,
-            totalBytes: combinedTotal
+            for: variant,
+            fraction: transfer.fraction,
+            downloadedBytes: transfer.downloadedBytes,
+            totalBytes: transfer.totalBytes
         )
     }
 
@@ -579,15 +580,15 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
-    private func updateDownloadState(fraction: Double, downloadedBytes: Int64, totalBytes: Int64) {
+    private func updateDownloadState(for variant: ModelVariant, fraction: Double, downloadedBytes: Int64, totalBytes: Int64) {
         let clamped = max(0, min(1, fraction.isFinite ? fraction : 0))
-        modelState = .downloading(
+        publishModelState(.downloading(
             DownloadStatus(
                 progress: clamped,
                 downloadedBytes: max(0, downloadedBytes),
                 totalBytes: max(0, totalBytes)
             )
-        )
+        ), for: variant)
     }
 
     // MARK: - Step 2: Mic capture
@@ -1114,13 +1115,58 @@ final class SpeechToTextManager: NSObject {
         return nil
     }
 
-    private var activeModelVariant: ModelVariant {
-        switch operationMode {
+    private func modelVariant(for mode: OperationMode) -> ModelVariant {
+        switch mode {
         case .liveStreaming:
             return .tiny
         case .postRecording:
             return .small
         }
+    }
+
+    private var activeModelVariant: ModelVariant {
+        modelVariant(for: operationMode)
+    }
+
+    private func isModelLoaded(for variant: ModelVariant) -> Bool {
+        switch variant {
+        case .tiny:
+            return liveWhisperKit != nil
+        case .small:
+            return finalWhisperKit != nil
+        }
+    }
+
+    private func resolvedModelState(for variant: ModelVariant) -> ModelState {
+        if isModelLoaded(for: variant) {
+            return .ready
+        }
+        return modelStateByVariant[variant] ?? .notDownloaded
+    }
+
+    private func publishModelState(_ state: ModelState, for variant: ModelVariant) {
+        modelStateByVariant[variant] = state
+        if variant == activeModelVariant {
+            modelState = state
+        }
+    }
+
+    private func existingPrepareTask(for variant: ModelVariant) -> Task<Void, Never>? {
+        prepareTaskLock.lock()
+        defer { prepareTaskLock.unlock() }
+        return inFlightPrepareTasks[variant]
+    }
+
+    private func setPrepareTask(_ task: Task<Void, Never>, for variant: ModelVariant) {
+        prepareTaskLock.lock()
+        inFlightPrepareTasks[variant] = task
+        prepareTaskLock.unlock()
+    }
+
+    private func clearPrepareTask(for variant: ModelVariant) {
+        prepareTaskLock.lock()
+        inFlightPrepareTasks[variant] = nil
+        prepareTaskLock.unlock()
     }
 
     private var isActiveModelLoaded: Bool {
@@ -1173,7 +1219,7 @@ final class SpeechToTextManager: NSObject {
             modelFolder = try await downloadFromCDN(variant: variant)
         }
 
-        try await loadModel(variant: variant, from: modelFolder)
+        try await loadModelWithRetry(variant: variant, from: modelFolder)
 
         switch variant {
         case .tiny:
@@ -1223,6 +1269,22 @@ final class SpeechToTextManager: NSObject {
                 modelFolder: folder.path,
                 profile: .finalSmallBalanced
             )
+        }
+    }
+
+    private func loadModelWithRetry(variant: ModelVariant, from folder: URL) async throws {
+        do {
+            try await loadModel(variant: variant, from: folder)
+        } catch {
+            let message = error.localizedDescription.lowercased()
+            let shouldRetry =
+                message.contains("tokenizer_config.json")
+                || message.contains("couldn't be moved")
+                || message.contains("couldn’t be moved")
+                || message.contains(".incomplete")
+            guard shouldRetry else { throw error }
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            try await loadModel(variant: variant, from: folder)
         }
     }
 

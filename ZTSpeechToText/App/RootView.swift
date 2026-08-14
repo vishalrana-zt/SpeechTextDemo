@@ -38,8 +38,10 @@ struct RootView: View {
     @State private var lastAppliedLiveWindowEnd: TimeInterval = 0
     @State private var lastLivePreviewAppliedAt: TimeInterval = 0
     @State private var selectedLanguage: SpeechToTextManager.SupportedLanguage = RootView.defaultSupportedLanguage()
-    @State private var selectedMode: CaptureMode = .postRecording
+    @State private var selectedMode: CaptureMode = .liveStreaming
+    @State private var isNoteEditorFocused = false
     private let liveDebugLoggingEnabled = true
+    private let bottomPanelReservedHeight: CGFloat = 60
 
     var body: some View {
         NavigationStack {
@@ -60,23 +62,36 @@ struct RootView: View {
                     .pickerStyle(.segmented)
                 }
 
-                LiveAwareTextView(
-                    text: $noteText,
-                    shouldAutoScrollLiveInsertion: selectedMode == .liveStreaming && isSpeechToTextSheetPresented,
-                    shouldShowLiveCaret: selectedMode == .liveStreaming
-                        && isSpeechToTextSheetPresented
-                        && !livePreviewText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
-                    .padding(4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color(.secondarySystemBackground))
+                ZStack(alignment: .topLeading) {
+                    LiveAwareTextView(
+                        text: $noteText,
+                        shouldAutoScrollLiveInsertion: selectedMode == .liveStreaming && isSpeechToTextSheetPresented,
+                        shouldShowLiveCaret: selectedMode == .liveStreaming
+                            && isSpeechToTextSheetPresented
+                            && !livePreviewText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                        onEditingChanged: { isFocused in
+                            isNoteEditorFocused = isFocused
+                        }
                     )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(Color(.separator).opacity(0.3), lineWidth: 1)
-                    )
-                   
+                        .padding(4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color(.secondarySystemBackground))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(Color(.separator).opacity(0.3), lineWidth: 1)
+                        )
+
+                    if shouldShowNotePlaceholder {
+                        Text("Tap the AI mic icon in the top-right to start dictating your note.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 16)
+                            .padding(.leading, 14)
+                            .allowsHitTesting(false)
+                    }
+                }
 
                 Spacer()
                     .contentShape(Rectangle())
@@ -85,6 +100,7 @@ struct RootView: View {
                     }
             }
             .padding()
+            .padding(.bottom, isSpeechToTextSheetPresented ? bottomPanelReservedHeight : 0)
             .navigationTitle("Notes")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -103,6 +119,7 @@ struct RootView: View {
                 }
             }
         }
+        .animation(.easeInOut(duration: 0.22), value: isSpeechToTextSheetPresented)
         .speechToTextSheet(
             isPresented: $isSpeechToTextSheetPresented,
             configuration: sheetConfiguration,
@@ -133,6 +150,10 @@ struct RootView: View {
             livePartialMinimumAudioSeconds: 0.6,
             livePollingIntervalNanoseconds: 600_000_000
         )
+    }
+
+    private var shouldShowNotePlaceholder: Bool {
+        noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isNoteEditorFocused
     }
 
     private func merge(_ baseText: String, with transcript: String) -> String {
@@ -253,6 +274,7 @@ private struct LiveAwareTextView: UIViewRepresentable {
     @Binding var text: String
     let shouldAutoScrollLiveInsertion: Bool
     let shouldShowLiveCaret: Bool
+    let onEditingChanged: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -269,6 +291,7 @@ private struct LiveAwareTextView: UIViewRepresentable {
         textView.alwaysBounceVertical = true
         textView.keyboardDismissMode = .interactive
         textView.textContainerInset = UIEdgeInsets(top: 8, left: 4, bottom: 8, right: 4)
+        textView.inputAccessoryView = context.coordinator.makeKeyboardAccessoryToolbar()
         textView.text = text
         context.coordinator.attach(textView: textView)
         return textView
@@ -314,6 +337,25 @@ private struct LiveAwareTextView: UIViewRepresentable {
 
         func attach(textView: UITextView) {
             self.textView = textView
+        }
+
+        func makeKeyboardAccessoryToolbar() -> UIToolbar {
+            let toolbar = UIToolbar()
+            toolbar.sizeToFit()
+            let flexible = UIBarButtonItem(systemItem: .flexibleSpace)
+            let done = UIBarButtonItem(
+                title: "Done",
+                style: .plain,
+                target: self,
+                action: #selector(doneButtonTapped)
+            )
+            toolbar.items = [flexible, done]
+            return toolbar
+        }
+
+        @objc
+        private func doneButtonTapped() {
+            textView?.resignFirstResponder()
         }
 
         func updateBaseText(_ text: String) {
@@ -408,6 +450,14 @@ private struct LiveAwareTextView: UIViewRepresentable {
         func textViewDidChange(_ textView: UITextView) {
             guard !isProgrammaticTextChange else { return }
             parent.text = textView.text
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            parent.onEditingChanged(true)
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            parent.onEditingChanged(false)
         }
 
     }

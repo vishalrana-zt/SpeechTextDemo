@@ -5,6 +5,7 @@
 
 import SwiftUI
 import UserNotifications
+import UIKit
 
 struct SpeechToTextSheetConfiguration {
     var preferredLanguage: SpeechToTextManager.SupportedLanguage? = nil
@@ -24,16 +25,13 @@ private struct SpeechToTextFlowSheet: View {
     @State private var didStartDownloadInThisSession = false
     @State private var isPreparingBundledModel = false
     @State private var wantsSetupCompletionNotification = false
-    @State private var didHandleSetupCompletion = false
     @State private var hasCollapsedToCompactDownloadingBar = false
     @State private var showNotifyInfoAlert = false
     @State private var notifyInfoTitle = ""
     @State private var notifyInfoMessage = ""
     @State private var shouldAutoStartRecording = false
-    @State private var showSetupReadyAlert = false
 
     private let manager = SpeechToTextManager.shared
-    private let compactDownloadBarPreferenceKey = "SpeechToTextFlowSheet.prefersCompactDownloadBar"
     let configuration: SpeechToTextSheetConfiguration
     let onLiveTranscriptChanged: (LiveTranscriptPartial) -> Void
     let onTextReady: (UUID, String) -> Void
@@ -45,50 +43,48 @@ private struct SpeechToTextFlowSheet: View {
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder),
+                            to: nil,
+                            from: nil,
+                            for: nil
+                        )
+                    }
+                }
+            }
             .onAppear {
-                manager.setOperationMode(configuration.operationMode)
-                hasCollapsedToCompactDownloadingBar = UserDefaults.standard.bool(forKey: compactDownloadBarPreferenceKey)
-                modelState = manager.modelState
-                shouldAutoStartRecording = false
-
                 manager.onModelStateChange = { state in
                     DispatchQueue.main.async { modelState = state }
                 }
-
-                if manager.isBundledModelSource {
-                    isPreparingBundledModel = true
-                    Task {
-                        await manager.prepareOnOptIn()
-                        await MainActor.run {
-                            isPreparingBundledModel = false
-                        }
-                    }
-                } else if manager.hasOptedIn {
-                    Task { await manager.restoreIfAlreadyDownloaded() }
-                } else {
-                    startDownloadIfNeeded()
-                }
+                applyModeSelection(configuration.operationMode, shouldKickoffSetup: true)
             }
             .onDisappear {
                 manager.onModelStateChange = nil
+            }
+            .onChange(of: configuration.operationMode) { _, newMode in
+                applyModeSelection(newMode, shouldKickoffSetup: true)
             }
             .onChange(of: modelState) { _, newState in
                 if case .downloading = newState {
                     didStartDownloadInThisSession = true
                 }
+                if case .loadingModel = newState {
+                    didStartDownloadInThisSession = true
+                }
 
-                guard didStartDownloadInThisSession, !didHandleSetupCompletion else { return }
+                guard didStartDownloadInThisSession else { return }
                 if case .ready = newState {
-                    didHandleSetupCompletion = true
                     UserDefaults.standard.set(false, forKey: compactDownloadBarPreferenceKey)
                     hasCollapsedToCompactDownloadingBar = false
 
                     if wantsSetupCompletionNotification {
                         scheduleSetupReadyNotification()
+                        wantsSetupCompletionNotification = false
                     }
-                    shouldAutoStartRecording = false
-                    didStartDownloadInThisSession = true
-                    showSetupReadyAlert = true
                     onSetupReady()
                 }
             }
@@ -97,18 +93,11 @@ private struct SpeechToTextFlowSheet: View {
             } message: {
                 Text(notifyInfoMessage)
             }
-            .alert("One-time model setup ready", isPresented: $showSetupReadyAlert) {
-                Button("OK", role: .cancel) {
-                    didStartDownloadInThisSession = false
-                }
-            } message: {
-                Text("Speech-to-text can now run fully offline.")
-            }
     }
 
     @ViewBuilder
     private var panelView: some View {
-        if case .ready = modelState, !didStartDownloadInThisSession {
+        if case .ready = modelState {
             RecordScreen(
                 autoStartOnAppear: shouldAutoStartRecording,
                 preferredLanguage: configuration.preferredLanguage,
@@ -132,6 +121,7 @@ private struct SpeechToTextFlowSheet: View {
         } else {
             DownloadScreen(
                 modelState: modelState,
+                modeTitle: modeTitle,
                 onPrimaryActionTapped: {
                     startDownloadIfNeeded(force: true)
                 },
@@ -184,6 +174,19 @@ private struct SpeechToTextFlowSheet: View {
         return "Loading model"
     }
 
+    private var compactDownloadBarPreferenceKey: String {
+        "SpeechToTextFlowSheet.prefersCompactDownloadBar.\(configuration.operationMode.rawValue)"
+    }
+
+    private var modeTitle: String {
+        switch configuration.operationMode {
+        case .liveStreaming:
+            return "Live streaming"
+        case .postRecording:
+            return "Post recording"
+        }
+    }
+
     private func startDownloadIfNeeded(force: Bool = false) {
         if manager.isBundledModelSource {
             isPreparingBundledModel = true
@@ -199,6 +202,36 @@ private struct SpeechToTextFlowSheet: View {
         guard force || !didStartDownloadInThisSession else { return }
         didStartDownloadInThisSession = true
         Task { await manager.prepareOnOptIn() }
+    }
+
+    private func applyModeSelection(_ mode: SpeechToTextManager.OperationMode, shouldKickoffSetup: Bool) {
+        manager.setOperationMode(mode)
+        hasCollapsedToCompactDownloadingBar = UserDefaults.standard.bool(forKey: compactDownloadBarPreferenceKey)
+        modelState = manager.modelState(for: mode)
+        shouldAutoStartRecording = false
+
+        if case .downloading = modelState {
+            didStartDownloadInThisSession = true
+        } else if case .loadingModel = modelState {
+            didStartDownloadInThisSession = true
+        } else {
+            didStartDownloadInThisSession = false
+        }
+
+        guard shouldKickoffSetup else { return }
+        if manager.isBundledModelSource {
+            isPreparingBundledModel = true
+            Task {
+                await manager.prepareOnOptIn()
+                await MainActor.run {
+                    isPreparingBundledModel = false
+                }
+            }
+        } else if manager.hasOptedIn {
+            Task { await manager.restoreIfAlreadyDownloaded() }
+        } else {
+            startDownloadIfNeeded()
+        }
     }
 
     private func requestNotifyPermissionAndShowMessage() {

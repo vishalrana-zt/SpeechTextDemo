@@ -10,6 +10,7 @@ struct DownloadScreen: View {
     @Environment(\.colorScheme) private var colorScheme
 
     let modelState: SpeechToTextManager.ModelState
+    let modeTitle: String
     let onPrimaryActionTapped: () -> Void
     let onNotifyTapped: () -> Void
     let onCompactDismissTapped: () -> Void
@@ -23,12 +24,14 @@ struct DownloadScreen: View {
 
     init(
         modelState: SpeechToTextManager.ModelState,
+        modeTitle: String = "Speech",
         onPrimaryActionTapped: @escaping () -> Void,
         onNotifyTapped: @escaping () -> Void = {},
         onCompactDismissTapped: @escaping () -> Void = {},
         showCompactDownloadingBar: Bool = false
     ) {
         self.modelState = modelState
+        self.modeTitle = modeTitle
         self.onPrimaryActionTapped = onPrimaryActionTapped
         self.onNotifyTapped = onNotifyTapped
         self.onCompactDismissTapped = onCompactDismissTapped
@@ -60,26 +63,37 @@ struct DownloadScreen: View {
     }
 
     private var regularPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Spacer()
-
-                if case .downloading(let status) = modelState, displayedProgress(for: status) < 0.995 {
-                    Button("Notify Me", action: onNotifyTapped)
-                        .font(.caption)
-                        .buttonStyle(.bordered)
-                }
-            }
-
+        VStack(alignment: .leading, spacing: 8) {
             switch modelState {
             case .notDownloaded:
-                Text("Download required (~500MB). After setup, transcription works fully offline.")
+                Text("\(modeTitle) model needs to be downloaded. After setup, transcription works fully offline.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Button("Enable Offline Setup", action: onPrimaryActionTapped)
                     .buttonStyle(.borderedProminent)
 
             case .downloading(let status):
+                HStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "waveform.badge.mic")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                        Text("Setting up model")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .layoutPriority(1)
+                    }
+                    Spacer()
+                    if displayedProgress(for: status) < 0.995 {
+                        Button("Notify Me", action: onNotifyTapped)
+                            .font(.caption)
+                            .controlSize(.small)
+                            .buttonStyle(.bordered)
+                    }
+                }
                 HStack(spacing: 10) {
                     ProgressView(value: displayedProgress(for: status))
                         .frame(maxWidth: .infinity)
@@ -93,17 +107,21 @@ struct DownloadScreen: View {
                     Text(metricsText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                } else {
+                    Text("Preparing offline speech recognition.\nKeeping this open can help it finish faster.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
             case .loadingModel:
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("Loading model...")
+                        Text("Finalizing model...")
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }
-                    Text("This may take a few seconds.")
+                    Text("Almost done. This may take a few seconds.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -121,7 +139,8 @@ struct DownloadScreen: View {
                     .buttonStyle(.bordered)
             }
         }
-        .padding(14)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -137,7 +156,7 @@ struct DownloadScreen: View {
     private func compactDownloadingBar(status: SpeechToTextManager.DownloadStatus) -> some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Downloading offline model")
+                Text("\(modeTitle) model download")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
