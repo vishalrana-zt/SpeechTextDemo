@@ -90,8 +90,10 @@ struct RootView: View {
                             .padding(.top, 16)
                             .padding(.leading, 14)
                             .allowsHitTesting(false)
+                            .transition(.opacity)
                     }
                 }
+                .animation(.easeInOut(duration: 0.18), value: shouldShowNotePlaceholder)
 
                 Spacer()
                     .contentShape(Rectangle())
@@ -110,12 +112,6 @@ struct RootView: View {
                         Image(systemName: "waveform.badge.mic")
                     }
                     .accessibilityLabel("Add note with voice")
-                }
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") {
-                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                    }
                 }
             }
         }
@@ -309,7 +305,7 @@ private struct LiveAwareTextView: UIViewRepresentable {
         }
         uiView.font = .preferredFont(forTextStyle: .body)
         uiView.textColor = .label
-        uiView.tintColor = shouldAutoScrollLiveInsertion ? .systemRed : .systemBlue
+        uiView.tintColor = .systemBlue
 
         if shouldAutoScrollLiveInsertion {
             context.coordinator.scrollToEnd(uiView)

@@ -5,7 +5,6 @@
 
 import SwiftUI
 import UserNotifications
-import UIKit
 
 struct SpeechToTextSheetConfiguration {
     var preferredLanguage: SpeechToTextManager.SupportedLanguage? = nil
@@ -43,19 +42,6 @@ private struct SpeechToTextFlowSheet: View {
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-            .toolbar {
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") {
-                        UIApplication.shared.sendAction(
-                            #selector(UIResponder.resignFirstResponder),
-                            to: nil,
-                            from: nil,
-                            for: nil
-                        )
-                    }
-                }
-            }
             .onAppear {
                 manager.onModelStateChange = { state in
                     DispatchQueue.main.async { modelState = state }

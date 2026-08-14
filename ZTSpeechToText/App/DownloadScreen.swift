@@ -21,6 +21,12 @@ struct DownloadScreen: View {
     @State private var downloadStartTime: Date?
     @State private var rateSamples: [(time: Date, downloadedBytes: Int64)] = []
     @State private var estimatedBytesPerSecond: Double = 0
+    
+    private enum UI {
+        static let panelSpacing: CGFloat = 8
+        static let panelHorizontalPadding: CGFloat = 10
+        static let panelVerticalPadding: CGFloat = 10
+    }
 
     init(
         modelState: SpeechToTextManager.ModelState,
@@ -63,10 +69,10 @@ struct DownloadScreen: View {
     }
 
     private var regularPanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: UI.panelSpacing) {
             switch modelState {
             case .notDownloaded:
-                Text("\(modeTitle) model needs to be downloaded. After setup, transcription works fully offline.")
+                Text("Download required for \(modeTitle). After setup, speech-to-text works fully offline.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Button("Enable Offline Setup", action: onPrimaryActionTapped)
@@ -108,7 +114,7 @@ struct DownloadScreen: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("Preparing offline speech recognition.\nKeeping this open can help it finish faster.")
+                    Text("Preparing offline speech recognition. Keeping this open can help it finish faster.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -117,7 +123,7 @@ struct DownloadScreen: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("Finalizing model...")
+                        Text("Finalizing \(modeTitle) model...")
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }
@@ -139,8 +145,8 @@ struct DownloadScreen: View {
                     .buttonStyle(.bordered)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 10)
+        .padding(.horizontal, UI.panelHorizontalPadding)
+        .padding(.vertical, UI.panelVerticalPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
