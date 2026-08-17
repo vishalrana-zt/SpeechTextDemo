@@ -126,12 +126,12 @@ struct RootView: View {
                 commitFinalTranscript(sessionID: sessionID, transcribedText)
             }
         )
-        .onChange(of: isSpeechToTextSheetPresented) { _, isPresented in
+        .onChange(of: isSpeechToTextSheetPresented) { isPresented in
             if !isPresented {
                 resetLiveDraftState(clearPreview: true)
             }
         }
-        .onChange(of: selectedMode) { _, _ in
+        .onChange(of: selectedMode) { _ in
             resetLiveDraftState(clearPreview: false)
         }
     }

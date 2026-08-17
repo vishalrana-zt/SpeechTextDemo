@@ -59,7 +59,7 @@ struct DownloadScreen: View {
                 updateDownloadMetrics(for: status)
             }
         }
-        .onChange(of: modelState) { _, newValue in
+        .onChange(of: modelState) { newValue in
             if case .downloading(let status) = newValue {
                 updateDownloadMetrics(for: status)
             } else {

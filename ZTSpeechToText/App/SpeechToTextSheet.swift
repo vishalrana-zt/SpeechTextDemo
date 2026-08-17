@@ -51,10 +51,10 @@ private struct SpeechToTextFlowSheet: View {
             .onDisappear {
                 manager.onModelStateChange = nil
             }
-            .onChange(of: configuration.operationMode) { _, newMode in
+            .onChange(of: configuration.operationMode) { newMode in
                 applyModeSelection(newMode, shouldKickoffSetup: true)
             }
-            .onChange(of: modelState) { _, newState in
+            .onChange(of: modelState) { newState in
                 if case .downloading = newState {
                     didStartDownloadInThisSession = true
                 }

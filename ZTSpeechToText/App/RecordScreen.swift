@@ -174,7 +174,7 @@ struct RecordScreen: View {
                 Toggle("Live transcription", isOn: $isLiveTranscriptionEnabled)
                     .font(.caption.weight(.semibold))
                     .tint(.accentColor)
-                    .onChange(of: isLiveTranscriptionEnabled) { _, isEnabled in
+                    .onChange(of: isLiveTranscriptionEnabled) { isEnabled in
                         manager.isLiveTranscriptionEnabled = isEnabled
                         if isEnabled {
                             startLiveTranscriptionIfNeeded()

@@ -595,8 +595,14 @@ final class SpeechToTextManager: NSObject {
 
     func requestMicPermission() async -> Bool {
         await withCheckedContinuation { continuation in
-            AVAudioApplication.requestRecordPermission { granted in
-                continuation.resume(returning: granted)
+            if #available(iOS 17.0, *) {
+                AVAudioApplication.requestRecordPermission { granted in
+                    continuation.resume(returning: granted)
+                }
+            } else {
+                AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                    continuation.resume(returning: granted)
+                }
             }
         }
     }
@@ -606,7 +612,11 @@ final class SpeechToTextManager: NSObject {
     func prewarmRecordingPathIfNeeded() {
         guard !didPrewarmRecordingPath else { return }
         guard case .ready = modelState else { return }
-        guard AVAudioApplication.shared.recordPermission == .granted else { return }
+        if #available(iOS 17.0, *) {
+            guard AVAudioApplication.shared.recordPermission == .granted else { return }
+        } else {
+            guard AVAudioSession.sharedInstance().recordPermission == .granted else { return }
+        }
         didPrewarmRecordingPath = true
 
         DispatchQueue.global(qos: .userInitiated).async {
