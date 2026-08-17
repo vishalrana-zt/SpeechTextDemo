@@ -46,13 +46,21 @@ private struct SpeechToTextFlowSheet: View {
                 manager.onModelStateChange = { state in
                     DispatchQueue.main.async { modelState = state }
                 }
-                applyModeSelection(configuration.operationMode, shouldKickoffSetup: true)
+                applyModeSelection(
+                    configuration.operationMode,
+                    shouldKickoffSetup: true,
+                    allowAutoStartWhenReady: true
+                )
             }
             .onDisappear {
                 manager.onModelStateChange = nil
             }
             .onChange(of: configuration.operationMode) { newMode in
-                applyModeSelection(newMode, shouldKickoffSetup: true)
+                applyModeSelection(
+                    newMode,
+                    shouldKickoffSetup: true,
+                    allowAutoStartWhenReady: false
+                )
             }
             .onChange(of: modelState) { newState in
                 if case .downloading = newState {
@@ -190,11 +198,18 @@ private struct SpeechToTextFlowSheet: View {
         Task { await manager.prepareOnOptIn() }
     }
 
-    private func applyModeSelection(_ mode: SpeechToTextManager.OperationMode, shouldKickoffSetup: Bool) {
+    private func applyModeSelection(
+        _ mode: SpeechToTextManager.OperationMode,
+        shouldKickoffSetup: Bool,
+        allowAutoStartWhenReady: Bool
+    ) {
         manager.setOperationMode(mode)
         hasCollapsedToCompactDownloadingBar = UserDefaults.standard.bool(forKey: compactDownloadBarPreferenceKey)
         modelState = manager.modelState(for: mode)
-        shouldAutoStartRecording = false
+        shouldAutoStartRecording = allowAutoStartWhenReady && {
+            if case .ready = modelState { return true }
+            return false
+        }()
 
         if case .downloading = modelState {
             didStartDownloadInThisSession = true

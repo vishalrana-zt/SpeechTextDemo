@@ -53,6 +53,13 @@ struct RecordScreen: View {
         pattern: #"\b([A-Za-z]+)n[íìîï]t\b"#,
         options: [.caseInsensitive]
     )
+    private let invalidTranscriptMarkers: [String] = [
+        "SwiftUI.ModifiedContent<",
+        "Text(storage:",
+        "_EnvironmentKeyTransformModifier<",
+        "AccentColorProvider",
+        "AnyTextStorage("
+    ]
 
     @State private var isListening = false
     @State private var isTranscribing = false
@@ -280,7 +287,7 @@ struct RecordScreen: View {
         if isListening || isTranscribing {
             return Text(statusText)
         }
-        return Text("Tap \(Text("Speak now").foregroundStyle(Color.accentColor).fontWeight(.bold)) to start recording")
+        return Text("Tap Speak now to start recording")
     }
 
     private var formattedRecordingDuration: String {
@@ -687,6 +694,10 @@ struct RecordScreen: View {
     }
 
     private func cleanedTranscript(_ text: String) -> String {
+        if invalidTranscriptMarkers.contains(where: { text.contains($0) }) {
+            liveDebugLog("filtered_invalid_transcript_dump")
+            return ""
+        }
         let nsText = text as NSString
         let fullRange = NSRange(location: 0, length: nsText.length)
         let withoutBlankAudio = blankAudioRegex.stringByReplacingMatches(in: text, options: [], range: fullRange, withTemplate: "")

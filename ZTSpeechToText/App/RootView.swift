@@ -42,6 +42,13 @@ struct RootView: View {
     @State private var isNoteEditorFocused = false
     private let liveDebugLoggingEnabled = true
     private let bottomPanelReservedHeight: CGFloat = 60
+    private let invalidTranscriptMarkers: [String] = [
+        "SwiftUI.ModifiedContent<",
+        "Text(storage:",
+        "_EnvironmentKeyTransformModifier<",
+        "AccentColorProvider",
+        "AnyTextStorage("
+    ]
 
     var body: some View {
         NavigationStack {
@@ -164,6 +171,10 @@ struct RootView: View {
     private func appendTranscript(_ transcript: String) {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        guard isValidTranscriptText(trimmed) else {
+            liveDebugLog("drop_invalid_final_text")
+            return
+        }
         let previous = noteText
         let merged = merge(previous, with: trimmed)
         noteText = merged
@@ -218,6 +229,10 @@ struct RootView: View {
     private func commitFinalTranscript(sessionID: UUID, _ finalText: String) {
         let trimmed = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        guard isValidTranscriptText(trimmed) else {
+            liveDebugLog("drop_invalid_committed_text")
+            return
+        }
 
         if selectedMode != .liveStreaming || liveSessionID == nil {
             appendTranscript(trimmed)
@@ -250,7 +265,12 @@ struct RootView: View {
     private func acceptedLivePreview(from incoming: String) -> String {
         let next = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !next.isEmpty else { return livePreviewText }
+        guard isValidTranscriptText(next) else { return livePreviewText }
         return next
+    }
+
+    private func isValidTranscriptText(_ text: String) -> Bool {
+        !invalidTranscriptMarkers.contains(where: { text.contains($0) })
     }
 
     private static func defaultSupportedLanguage() -> SpeechToTextManager.SupportedLanguage {

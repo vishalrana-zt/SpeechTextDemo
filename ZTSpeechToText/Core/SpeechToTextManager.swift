@@ -9,6 +9,7 @@
 import Foundation
 import AVFoundation
 import CoreML
+import Speech
 import WhisperKit
 
 final class SpeechToTextManager: NSObject {
@@ -53,6 +54,11 @@ final class SpeechToTextManager: NSObject {
     enum OperationMode: String, CaseIterable {
         case liveStreaming
         case postRecording
+    }
+    
+    enum TranscriptionEngine: String {
+        case whisperKit
+        case speechAnalyzer
     }
 
     struct DownloadStatus: Equatable {
@@ -115,6 +121,9 @@ final class SpeechToTextManager: NSObject {
     private var didPrewarmRecordingPath = false
     private var didPrewarmLiveDecode = false
     private var isPrewarmingSmallModel = false
+    private var hasLoggedRuntimeConfig = false
+    private var hasDisabledSpeechAnalyzerForSession = false
+    private var hasValidatedSpeechAnalyzerForSession = false
     private actor LiveDecodeCoordinator {
         private var isInFlight = false
         private var lastStart: Date?
@@ -149,6 +158,11 @@ final class SpeechToTextManager: NSObject {
 
     var onSilenceAutoStopTriggered: (() -> Void)?
     var onAudioLevelChange: ((Float) -> Void)?
+    
+    /// Safe feature flag:
+    /// - false (default): WhisperKit-only behavior (existing path)
+    /// - true: prefers SpeechAnalyzer when runtime supports it, with automatic fallback to WhisperKit
+    var useSpeechAnalyzerWhenAvailable: Bool = false
 
     private static let modelReadyKey = "SpeechToTextManager.modelReadyV2"
     private static let optedInKey = "SpeechToTextManager.optedIn"
@@ -156,13 +170,17 @@ final class SpeechToTextManager: NSObject {
     private static let tinyModelName = "openai_whisper-tiny"
     private static let smallModelName = "openai_whisper-small"
     private static let modelRepo = "argmaxinc/whisperkit-coreml"
-    private static let tinyModelZipURL = URL(string: "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-tiny.zip")!
-    private static let smallModelZipURL = URL(string: "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-small.zip")!
+    private static let tinyModelZipURL = requiredURL(
+        "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-tiny.zip"
+    )
+    private static let smallModelZipURL = requiredURL(
+        "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-small.zip"
+    )
     
     /// True once the model is downloaded AND loaded into memory — the only
     /// state in which recording/transcription is actually usable.
     var isReady: Bool {
-        if case .ready = resolvedModelState(for: activeModelVariant) { return true }
+        if case .ready = modelState(for: operationMode) { return true }
         return false
     }
 
@@ -235,15 +253,32 @@ final class SpeechToTextManager: NSObject {
         Self.modelSource == .bundled
     }
 
+    private static func requiredURL(_ value: String) -> URL {
+        guard let url = URL(string: value) else {
+            preconditionFailure("Invalid URL: \(value)")
+        }
+        return url
+    }
+
     func modelState(for mode: OperationMode) -> ModelState {
         let variant = modelVariant(for: mode)
-        return resolvedModelState(for: variant)
+        if canUseSpeechAnalyzer {
+            // Strict contract: SpeechAnalyzer-enabled sessions are considered ready
+            // only if the same-mode Whisper fallback model is also ready.
+            let fallbackState = modelStateWithoutSpeechAnalyzerOverride(for: variant)
+            if case .ready = fallbackState {
+                return .ready
+            }
+            return fallbackState
+        }
+        return modelStateWithoutSpeechAnalyzerOverride(for: variant)
     }
 
     func setOperationMode(_ mode: OperationMode) {
         guard operationMode != mode else { return }
         operationMode = mode
         modelState = modelState(for: mode)
+        debugLogRuntimeConfiguration(reason: "operation_mode_changed")
     }
     
     // Safe to call again on relaunch if a previous download was interrupted —
@@ -254,6 +289,11 @@ final class SpeechToTextManager: NSObject {
 
     private func prepareOnOptIn(for variant: ModelVariant) async {
         UserDefaults.standard.set(true, forKey: Self.optedInKey)
+        
+        if canUseSpeechAnalyzer {
+            publishModelState(.ready, for: variant)
+            return
+        }
 
         if let existingTask = existingPrepareTask(for: variant) {
             await existingTask.value
@@ -342,8 +382,9 @@ final class SpeechToTextManager: NSObject {
     /// if false, the caller should navigate to / show the download-progress UI
     /// instead of proceeding, and resume the download if it isn't already running.
     func gateFeatureUsage() async -> Bool {
+        _ = await ensureSpeechAnalyzerReadyForUse()
         let activeVariant = activeModelVariant
-        let currentState = resolvedModelState(for: activeVariant)
+        let currentState = modelState(for: operationMode)
         if case .ready = currentState { return true }
         if hasOptedIn, case .downloading = currentState {
             return false // already downloading, just show progress UI
@@ -353,6 +394,7 @@ final class SpeechToTextManager: NSObject {
         }
         if hasOptedIn {
             await prepareOnOptIn(for: activeVariant) // opted in earlier, download never finished/started this session
+            if case .ready = modelState(for: operationMode) { return true }
         }
         return false
     }
@@ -666,7 +708,9 @@ final class SpeechToTextManager: NSObject {
         silenceDuration: TimeInterval = 1.0,
         silenceThreshold: Float = 0.003
     ) throws {
-        guard case .ready = modelState else { throw STTError.notReady }
+        let currentModelState = modelState(for: operationMode)
+        modelState = currentModelState
+        guard case .ready = currentModelState else { throw STTError.notReady }
 
         self.autoStopOnSilence = autoStopOnSilence
         requiredSilenceDuration = silenceDuration
@@ -804,6 +848,33 @@ final class SpeechToTextManager: NSObject {
     /// In live-streaming mode, this final decode is performed with the Small model
     /// for higher post-recording accuracy.
     func transcribe(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
+        debugLogRuntimeConfiguration(reason: "final_transcribe")
+        let preferredEngine = preferredFinalTranscriptionEngine()
+        debugLogEngineSelection(
+            phase: "final_transcribe",
+            engine: preferredEngine,
+            detail: "mode=\(operationMode.rawValue) preferredLanguage=\(preferredLanguage?.rawValue ?? "auto")"
+        )
+        switch preferredEngine {
+        case .whisperKit:
+            return try await transcribeWithWhisperKit(preferredLanguage: preferredLanguage)
+        case .speechAnalyzer:
+            do {
+                return try await transcribeWithSpeechAnalyzer(preferredLanguage: preferredLanguage)
+            } catch {
+                if shouldDisableSpeechAnalyzer(for: error) {
+                    hasDisabledSpeechAnalyzerForSession = true
+#if DEBUG
+                    print("[LIVE_DEBUG][SpeechToTextManager] speech_analyzer_disabled_for_session reason=\"\(error.localizedDescription)\"")
+#endif
+                    return try await transcribeWithWhisperKit(preferredLanguage: preferredLanguage)
+                }
+                throw error
+            }
+        }
+    }
+
+    private func transcribeWithWhisperKit(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
 #if DEBUG
         print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase start")
 #endif
@@ -862,6 +933,50 @@ final class SpeechToTextManager: NSObject {
     /// Lightweight partial transcription for live preview while recording.
     /// Uses a short rolling audio window to keep decoding fast.
     func transcribePartialCurrentBuffer(
+        preferredLanguage: SupportedLanguage? = nil,
+        maxAudioSeconds: Double = 8.0,
+        minimumAudioSeconds: Double = 0.8
+    ) async throws -> LivePartialResult? {
+        debugLogRuntimeConfiguration(reason: "live_partial")
+        let preferredEngine = preferredLivePartialEngine()
+        debugLogEngineSelection(
+            phase: "live_partial",
+            engine: preferredEngine,
+            detail: "mode=\(operationMode.rawValue) preferredLanguage=\(preferredLanguage?.rawValue ?? "auto")"
+        )
+        switch preferredEngine {
+        case .whisperKit:
+            return try await transcribePartialCurrentBufferWithWhisperKit(
+                preferredLanguage: preferredLanguage,
+                maxAudioSeconds: maxAudioSeconds,
+                minimumAudioSeconds: minimumAudioSeconds
+            )
+        case .speechAnalyzer:
+            do {
+                return try await transcribePartialCurrentBufferWithSpeechAnalyzer(
+                    preferredLanguage: preferredLanguage,
+                    maxAudioSeconds: maxAudioSeconds,
+                    minimumAudioSeconds: minimumAudioSeconds
+                )
+            } catch {
+                if shouldDisableSpeechAnalyzer(for: error) {
+                    hasDisabledSpeechAnalyzerForSession = true
+#if DEBUG
+                    print("[LIVE_DEBUG][SpeechToTextManager] speech_analyzer_disabled_for_session reason=\"\(error.localizedDescription)\"")
+#endif
+                    _ = try await ensureModelLoaded(for: .tiny)
+                    return try await transcribePartialCurrentBufferWithWhisperKit(
+                        preferredLanguage: preferredLanguage,
+                        maxAudioSeconds: maxAudioSeconds,
+                        minimumAudioSeconds: minimumAudioSeconds
+                    )
+                }
+                throw error
+            }
+        }
+    }
+    
+    private func transcribePartialCurrentBufferWithWhisperKit(
         preferredLanguage: SupportedLanguage? = nil,
         maxAudioSeconds: Double = 8.0,
         minimumAudioSeconds: Double = 0.8
@@ -936,7 +1051,7 @@ final class SpeechToTextManager: NSObject {
 
 #if DEBUG
         print(
-            "[LIVE_DEBUG][SpeechToTextManager] partial_decode_start full_audio_s=\(String(format: "%.2f", Double(fullAudio.count) / targetSampleRate)) window_s=\(String(format: "%.2f", Double(audioWindow.count) / targetSampleRate)) lang=\(resolvedLanguage.rawValue)"
+            "[LIVE_DEBUG][SpeechToTextManager] partial_decode_start model=\(Self.tinyModelName) full_audio_s=\(String(format: "%.2f", Double(fullAudio.count) / targetSampleRate)) window_s=\(String(format: "%.2f", Double(audioWindow.count) / targetSampleRate)) lang=\(resolvedLanguage.rawValue)"
         )
 #endif
         let results = try await liveWhisperKit.transcribe(audioArray: audioWindow, decodeOptions: options)
@@ -1148,6 +1263,13 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func resolvedModelState(for variant: ModelVariant) -> ModelState {
+        if canUseSpeechAnalyzer, case .ready = modelStateWithoutSpeechAnalyzerOverride(for: variant) {
+            return .ready
+        }
+        return modelStateWithoutSpeechAnalyzerOverride(for: variant)
+    }
+
+    private func modelStateWithoutSpeechAnalyzerOverride(for variant: ModelVariant) -> ModelState {
         if isModelLoaded(for: variant) {
             return .ready
         }
@@ -1243,6 +1365,7 @@ final class SpeechToTextManager: NSObject {
 
     /// Best-effort background warmup to reduce first stop-time latency in live mode.
     func prewarmSmallFinalModelIfNeeded() {
+        guard !canUseSpeechAnalyzer else { return }
         if isLiveTranscriptionEnabled {
 #if DEBUG
             print("[LIVE_DEBUG][SpeechToTextManager] prewarm_small_skipped reason=live_mode_on")
@@ -1296,6 +1419,222 @@ final class SpeechToTextManager: NSObject {
             try? await Task.sleep(nanoseconds: 650_000_000)
             try await loadModel(variant: variant, from: folder)
         }
+    }
+    
+    private func preferredFinalTranscriptionEngine() -> TranscriptionEngine {
+        canUseSpeechAnalyzer ? .speechAnalyzer : .whisperKit
+    }
+    
+    private func preferredLivePartialEngine() -> TranscriptionEngine {
+        canUseSpeechAnalyzer ? .speechAnalyzer : .whisperKit
+    }
+    
+    private var canAttemptSpeechAnalyzer: Bool {
+        guard useSpeechAnalyzerWhenAvailable else { return false }
+        guard !hasDisabledSpeechAnalyzerForSession else { return false }
+        if #available(iOS 26.0, *) {
+            return true
+        }
+        return false
+    }
+
+    private var canUseSpeechAnalyzer: Bool {
+        canAttemptSpeechAnalyzer && hasValidatedSpeechAnalyzerForSession
+    }
+    
+    private func transcribeWithSpeechAnalyzer(preferredLanguage: SupportedLanguage?) async throws -> (text: String, language: SupportedLanguage) {
+        guard #available(iOS 26.0, *), canUseSpeechAnalyzer else { throw STTError.notReady }
+        if isListening { stopListening() }
+        let audio = snapshotAudioBuffer()
+        guard !audio.isEmpty else { throw STTError.emptyRecording }
+        let localeHint = speechAnalyzerLocaleHint(for: preferredLanguage)
+        let engine = SpeechAnalyzerTranscriptionEngine()
+        let audioSeconds = Double(audio.count) / targetSampleRate
+        debugLogEngineSelection(
+            phase: "speech_analyzer_final",
+            engine: .speechAnalyzer,
+            detail: "preset=transcription localeHint=\(localeHint?.identifier ?? "auto") audio_s=\(String(format: "%.2f", audioSeconds))"
+        )
+        let output = try await engine.transcribe(
+            audio: audio,
+            sampleRate: targetSampleRate,
+            localeHint: localeHint,
+            preset: .transcription
+        )
+        let resolvedLanguage = supportedLanguage(from: output.locale, fallback: preferredLanguage)
+        lastLiveResolvedLanguage = resolvedLanguage
+        return (output.text, resolvedLanguage)
+    }
+    
+    private func transcribePartialCurrentBufferWithSpeechAnalyzer(
+        preferredLanguage: SupportedLanguage?,
+        maxAudioSeconds: Double,
+        minimumAudioSeconds: Double
+    ) async throws -> LivePartialResult? {
+        guard #available(iOS 26.0, *), canUseSpeechAnalyzer else { throw STTError.notReady }
+        guard await beginLivePartialDecodeIfPossible() else { return nil }
+        defer {
+            Task(priority: .utility) { [liveDecodeCoordinator] in
+                await liveDecodeCoordinator.end()
+            }
+        }
+
+        let fullAudio = snapshotAudioBuffer()
+        let minimumSamples = Int(targetSampleRate * max(0.2, minimumAudioSeconds))
+        guard fullAudio.count >= minimumSamples else { return nil }
+
+        let audioWindow = recentAudioWindow(fullAudio, maxSeconds: maxAudioSeconds)
+        let windowStartSample = max(0, fullAudio.count - audioWindow.count)
+        let windowStartTime = TimeInterval(windowStartSample) / targetSampleRate
+        let windowEndTime = TimeInterval(fullAudio.count) / targetSampleRate
+        let languageHint = preferredLanguage ?? liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+        let localeHint = speechAnalyzerLocaleHint(for: languageHint)
+        let engine = SpeechAnalyzerTranscriptionEngine()
+        let audioSeconds = Double(audioWindow.count) / targetSampleRate
+        debugLogEngineSelection(
+            phase: "speech_analyzer_partial",
+            engine: .speechAnalyzer,
+            detail: "preset=progressiveTranscription localeHint=\(localeHint?.identifier ?? "auto") window_s=\(String(format: "%.2f", audioSeconds))"
+        )
+        let output = try await engine.transcribe(
+            audio: audioWindow,
+            sampleRate: targetSampleRate,
+            localeHint: localeHint,
+            preset: .progressiveTranscription
+        )
+
+        let text = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+
+        let resolvedLanguage = supportedLanguage(from: output.locale, fallback: languageHint)
+        if pendingLiveLockLanguage == resolvedLanguage {
+            pendingLiveLockConfirmations += 1
+        } else {
+            pendingLiveLockLanguage = resolvedLanguage
+            pendingLiveLockConfirmations = 1
+        }
+        if pendingLiveLockConfirmations >= liveLanguageLockConfirmationsRequired {
+            liveLockedLanguage = resolvedLanguage
+        }
+        lastLiveResolvedLanguage = resolvedLanguage
+        await liveDecodeCoordinator.markTextEmitted()
+
+        let segments = [
+            LiveTranscriptSegment(
+                startTime: windowStartTime,
+                endTime: windowEndTime,
+                text: text
+            )
+        ]
+        return LivePartialResult(
+            text: text,
+            language: resolvedLanguage,
+            windowStartTime: windowStartTime,
+            windowEndTime: windowEndTime,
+            segments: segments
+        )
+    }
+
+    private func shouldDisableSpeechAnalyzer(for error: Error) -> Bool {
+        if error is CancellationError { return false }
+        let message = error.localizedDescription.lowercased()
+        if message.contains("not subscribed to transcription")
+            || message.contains("cannot check the download status")
+            || message.contains("asset")
+            || message.contains("speech recognition")
+            || message.contains("authorization")
+            || message.contains("unsupported locale") {
+            return true
+        }
+        // In live usage, any recurring SpeechAnalyzer runtime error should
+        // fail open to WhisperKit for this run instead of spamming retries.
+        return true
+    }
+
+    private func ensureSpeechAnalyzerReadyForUse() async -> Bool {
+        guard canAttemptSpeechAnalyzer else { return false }
+        guard !hasValidatedSpeechAnalyzerForSession else { return true }
+        guard #available(iOS 26.0, *) else { return false }
+
+        do {
+            let engine = SpeechAnalyzerTranscriptionEngine()
+            let preferred = liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+            let localeHint = speechAnalyzerLocaleHint(for: preferred)
+            try await engine.prepare(
+                localeHint: speechAnalyzerLocaleHint(for: preferred),
+                preset: .progressiveTranscription
+            )
+            // Readiness must prove decode viability, not only asset preparation.
+            // This avoids showing "Speak now" when subscription/asset status will fail on first decode.
+            _ = try await engine.transcribe(
+                audio: speechAnalyzerPreflightProbeAudio(),
+                sampleRate: targetSampleRate,
+                localeHint: localeHint,
+                preset: .progressiveTranscription
+            )
+            hasValidatedSpeechAnalyzerForSession = true
+#if DEBUG
+            print("[LIVE_DEBUG][SpeechToTextManager] speech_analyzer_preflight_ready mode=prepare_plus_probe")
+#endif
+            return true
+        } catch {
+            hasDisabledSpeechAnalyzerForSession = true
+            hasValidatedSpeechAnalyzerForSession = false
+#if DEBUG
+            print("[LIVE_DEBUG][SpeechToTextManager] speech_analyzer_preflight_failed reason=\"\(error.localizedDescription)\"")
+#endif
+            return false
+        }
+    }
+
+    private func speechAnalyzerPreflightProbeAudio() -> [Float] {
+        let sampleCount = max(1, Int(targetSampleRate * 0.35))
+        return Array(repeating: 0, count: sampleCount)
+    }
+
+    private func speechAnalyzerLocaleHint(for language: SupportedLanguage?) -> Locale? {
+        guard let language else { return nil }
+        switch language {
+        case .english:
+            return Locale(identifier: "en-US")
+        case .spanish:
+            return Locale(identifier: "es-ES")
+        case .french:
+            return Locale(identifier: "fr-FR")
+        }
+    }
+
+    private func supportedLanguage(from locale: Locale, fallback: SupportedLanguage?) -> SupportedLanguage {
+        let identifier = locale.identifier.lowercased()
+        if identifier.hasPrefix("en") { return .english }
+        if identifier.hasPrefix("es") { return .spanish }
+        if identifier.hasPrefix("fr") { return .french }
+        return fallback ?? preferredDeviceSupportedLanguage() ?? .english
+    }
+
+    private func debugLogRuntimeConfiguration(reason: String) {
+#if DEBUG
+        guard !hasLoggedRuntimeConfig else { return }
+        hasLoggedRuntimeConfig = true
+        let source: String
+        switch Self.modelSource {
+        case .bundled:
+            source = "bundled"
+        case .cdn:
+            source = "cdn"
+        case .huggingface:
+            source = "huggingface"
+        }
+        print(
+            "[LIVE_DEBUG][SpeechToTextManager] runtime_config reason=\(reason) useSpeechAnalyzerWhenAvailable=\(useSpeechAnalyzerWhenAvailable) canUseSpeechAnalyzer=\(canUseSpeechAnalyzer) modelSource=\(source) operationMode=\(operationMode.rawValue) liveModel=\(Self.tinyModelName) finalModel=\(Self.smallModelName)"
+        )
+#endif
+    }
+
+    private func debugLogEngineSelection(phase: String, engine: TranscriptionEngine, detail: String) {
+#if DEBUG
+        print("[LIVE_DEBUG][SpeechToTextManager] engine_selected phase=\(phase) engine=\(engine.rawValue) \(detail)")
+#endif
     }
 
     private func logDetectedLanguage(stage: String, language: SupportedLanguage) {
