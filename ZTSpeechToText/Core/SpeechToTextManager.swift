@@ -164,15 +164,39 @@ final class SpeechToTextManager: NSObject {
     private var hasTriggeredAutoStop = false
     private let maxRecordingDuration: TimeInterval = 10 * 60
     private var liveLockedLanguage: SupportedLanguage?
+    private var sessionPreferredLanguageHint: SupportedLanguage?
     private var pendingLiveLockLanguage: SupportedLanguage?
     private var pendingLiveLockConfirmations: Int = 0
     private var lastLiveResolvedLanguage: SupportedLanguage?
     private let liveLanguageLockMinimumSeconds: Double = 2.0
     private let liveLanguageLockConfirmationsRequired: Int = 2
+    private let advancedLiveStreamStartupGraceSeconds: TimeInterval = 1.6
     private var didPrewarmRecordingPath = false
     private var hasLoggedRuntimeConfig = false
     private var hasDisabledSpeechAnalyzerForSession = false
+    private var hasDisabledAdvancedLiveStreamForSession = false
     private var hasValidatedSpeechAnalyzerForSession = false
+    private var loggedAppleGateFailures: Set<String> = []
+    private var advancedLiveStreamNoResultStreak: Int = 0
+    private let advancedLiveStreamNoResultDisableThreshold: Int = 8
+    private let advancedLiveStreamNoResultMinimumLiveSeconds: TimeInterval = 3.5
+    private var liveCaptureStartedAt: Date?
+    private var activeCaptureSessionID: UUID?
+    private struct SessionTranscribeCache {
+        let sessionID: UUID
+        let result: (text: String, language: SupportedLanguage)
+        let timestamp: Date
+    }
+    private var lastSessionTranscribeCache: SessionTranscribeCache?
+    private var lastPublishedLivePartialText: String = ""
+    private var lastPublishedLivePartialWindowStartTime: TimeInterval = 0
+    private var lastPublishedLivePartialWindowEndTime: TimeInterval = 0
+    private var lastPublishedLivePartialAt: Date = .distantPast
+    private let livePartialEmitMinimumInterval: TimeInterval = 0.30
+    private let livePartialEmitMinimumCharAdvance: Int = 10
+    private let livePartialEmitMinimumWindowAdvance: TimeInterval = 0.90
+    private let firstLivePartialMinimumWindowEnd: TimeInterval = 1.80
+    private let firstLivePartialMinimumChars: Int = 10
     private let appleCapabilityLock = NSLock()
     private var advancedAppleTranscriberCapable = false
     private var didCheckAdvancedAppleTranscriberCapability = false
@@ -215,6 +239,8 @@ final class SpeechToTextManager: NSObject {
     private var appleLiveFinalText: String?
     private var lastNonEmptyLiveTranscriptText: String?
     private var isAppleLiveSessionStarting = false
+    private let transcriptionLifecycleLock = NSLock()
+    private var isFinalizingTranscript = false
     // SpeechRecognizer fallback needs a stable committed/volatile split to avoid
     // rolling-window rewrites and repeated text on long live sessions.
     private var speechRecognizerCommittedWords: [String] = []
@@ -227,6 +253,19 @@ final class SpeechToTextManager: NSObject {
         appleLiveStateLock.lock()
         appleLiveFinalText = text
         appleLiveStateLock.unlock()
+    }
+
+    private func setFinalizingTranscript(_ finalizing: Bool) {
+        transcriptionLifecycleLock.lock()
+        isFinalizingTranscript = finalizing
+        transcriptionLifecycleLock.unlock()
+    }
+
+    private func getFinalizingTranscript() -> Bool {
+        transcriptionLifecycleLock.lock()
+        let value = isFinalizingTranscript
+        transcriptionLifecycleLock.unlock()
+        return value
     }
 
     private func getAppleLiveFinalText() -> String? {
@@ -277,16 +316,48 @@ final class SpeechToTextManager: NSObject {
     }
 
     private var useAdvancedAppleLiveTranscribers: Bool {
-        guard #available(iOS 26.0, *) else { return false }
-        guard selectedModelProvider == .appleModels else { return false }
-        guard operationMode == .liveStreaming else { return false }
-        guard isAdvancedApplePathExplicitlyEnabled else { return false }
-        guard !hasDisabledSpeechAnalyzerForSession else { return false }
-        guard !isAppleAdvancedPathQuarantined() else { return false }
+        guard #available(iOS 26.0, *) else {
+            logAppleGateFailure("ios_version")
+            return false
+        }
+        guard selectedModelProvider == .appleModels else {
+            logAppleGateFailure("model_provider")
+            return false
+        }
+        guard operationMode == .liveStreaming else {
+            logAppleGateFailure("operation_mode")
+            return false
+        }
+        guard isAdvancedApplePathExplicitlyEnabled else {
+            logAppleGateFailure("explicit_opt_in")
+            return false
+        }
+        guard !hasDisabledSpeechAnalyzerForSession else {
+            logAppleGateFailure("disabled_for_session")
+            return false
+        }
+        guard !hasDisabledAdvancedLiveStreamForSession else {
+            logAppleGateFailure("live_stream_disabled_for_session")
+            return false
+        }
+        guard !isAppleAdvancedPathQuarantined() else {
+            logAppleGateFailure("quarantined")
+            return false
+        }
         appleCapabilityLock.lock()
         let enabled = advancedAppleTranscriberCapable
         appleCapabilityLock.unlock()
+        if !enabled {
+            logAppleGateFailure("runtime_capability_check")
+        }
         return enabled
+    }
+
+    private func logAppleGateFailure(_ reason: String) {
+        let key = "\(operationMode.rawValue):\(reason)"
+        guard !loggedAppleGateFailures.contains(key) else { return }
+        loggedAppleGateFailures.insert(key)
+        debugTrace("apple_gate fail=\(reason)")
     }
 
     private func setAdvancedAppleTranscriberCapability(_ enabled: Bool, checked: Bool) {
@@ -347,7 +418,11 @@ final class SpeechToTextManager: NSObject {
         defaults.set(false, forKey: Self.appleAdvancedQuarantinedKey)
         defaults.set(false, forKey: Self.appleAdvancedArmedKey)
         hasDisabledSpeechAnalyzerForSession = false
+        hasDisabledAdvancedLiveStreamForSession = false
         hasValidatedSpeechAnalyzerForSession = false
+        advancedLiveStreamNoResultStreak = 0
+        resetLivePartialOutputState()
+        sessionPreferredLanguageHint = nil
         setAdvancedAppleTranscriberCapability(false, checked: false)
         Task(priority: .utility) { [weak self] in
             await self?.refreshAdvancedAppleTranscriberCapabilityIfNeeded(force: true)
@@ -444,7 +519,14 @@ final class SpeechToTextManager: NSObject {
         cancelSpeechAnalyzerValidationTaskIfNeeded()
         selectedModelProvider = provider
         hasDisabledSpeechAnalyzerForSession = false
+        hasDisabledAdvancedLiveStreamForSession = false
         hasValidatedSpeechAnalyzerForSession = false
+        loggedAppleGateFailures.removeAll()
+        advancedLiveStreamNoResultStreak = 0
+        resetLivePartialOutputState()
+        liveCaptureStartedAt = nil
+        activeCaptureSessionID = nil
+        lastSessionTranscribeCache = nil
         setAdvancedAppleTranscriberCapability(false, checked: false)
         hasLoggedRuntimeConfig = false
         setAppleLiveFinalText(nil)
@@ -463,7 +545,20 @@ final class SpeechToTextManager: NSObject {
     func setOperationMode(_ mode: OperationMode) {
         guard operationMode != mode else { return }
         operationMode = mode
+        // Mode switch should start with a fresh analyzer session gate.
+        // Otherwise a live-mode disable can incorrectly force recognizer in post mode.
+        hasDisabledSpeechAnalyzerForSession = false
+        hasDisabledAdvancedLiveStreamForSession = false
+        hasValidatedSpeechAnalyzerForSession = false
+        loggedAppleGateFailures.removeAll()
+        advancedLiveStreamNoResultStreak = 0
+        resetLivePartialOutputState()
+        liveCaptureStartedAt = nil
+        activeCaptureSessionID = nil
+        lastSessionTranscribeCache = nil
+        sessionPreferredLanguageHint = nil
         modelState = modelState(for: mode)
+        publishBackendStatus()
         debugLogRuntimeConfiguration(reason: "operation_mode_changed")
     }
     
@@ -558,6 +653,7 @@ final class SpeechToTextManager: NSObject {
     }
 
     func startListening(
+        preferredLanguage: SupportedLanguage? = nil,
         autoStopOnSilence: Bool = false,
         silenceDuration: TimeInterval = 1.0,
         silenceThreshold: Float = 0.003
@@ -572,11 +668,23 @@ final class SpeechToTextManager: NSObject {
         accumulatedSilenceDuration = 0
         accumulatedRecordingDuration = 0
         hasTriggeredAutoStop = false
-        liveLockedLanguage = nil
+        liveCaptureStartedAt = Date()
+        activeCaptureSessionID = UUID()
+        lastSessionTranscribeCache = nil
+        hasDisabledSpeechAnalyzerForSession = false
+        hasDisabledAdvancedLiveStreamForSession = false
+        hasValidatedSpeechAnalyzerForSession = false
+        loggedAppleGateFailures.removeAll()
+        advancedLiveStreamNoResultStreak = 0
+        sessionPreferredLanguageHint = preferredLanguage
+        liveLockedLanguage = preferredLanguage
         pendingLiveLockLanguage = nil
         pendingLiveLockConfirmations = 0
         lastLiveResolvedLanguage = nil
+        setFinalizingTranscript(false)
         setAppleLiveFinalText(nil)
+        advancedLiveStreamNoResultStreak = 0
+        resetLivePartialOutputState()
         appleLiveStateLock.lock()
         lastNonEmptyLiveTranscriptText = nil
         appleLiveStateLock.unlock()
@@ -719,10 +827,12 @@ final class SpeechToTextManager: NSObject {
         accumulatedSilenceDuration = 0
         accumulatedRecordingDuration = 0
         hasTriggeredAutoStop = false
+        liveCaptureStartedAt = nil
         speechRecognizerCommittedWords = []
         speechRecognizerLastHypothesisWords = []
         speechRecognizerLastVolatileWords = []
         speechRecognizerLastWindowStartTime = 0
+        resetLivePartialOutputState()
         Task(priority: .utility) { [liveDecodeCoordinator] in
             await liveDecodeCoordinator.reset()
         }
@@ -787,12 +897,18 @@ final class SpeechToTextManager: NSObject {
         do {
             armAppleAdvancedPath()
             let coordinator = AppleLiveTranscriptionCoordinator()
-            let localeHint = speechAnalyzerLocaleHint(for: liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english)
+            let language = liveLockedLanguage
+                ?? sessionPreferredLanguageHint
+                ?? pendingLiveLockLanguage
+                ?? preferredDeviceSupportedLanguage()
+                ?? .english
+            let localeHint = speechAnalyzerLocaleHint(for: language)
             _ = try await coordinator.start(localeHint: localeHint)
             appleLiveCoordinator = coordinator
         } catch {
             disarmAppleAdvancedPath()
-            hasDisabledSpeechAnalyzerForSession = true
+            hasDisabledAdvancedLiveStreamForSession = true
+            debugTrace("live_stream session_start_failed fallback=windowed_partial error=\(error.localizedDescription)")
         }
     }
 
@@ -833,6 +949,21 @@ final class SpeechToTextManager: NSObject {
     /// In live-streaming mode, this final decode is performed with the Small model
     /// for higher post-recording accuracy.
     func transcribe(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
+        let transcribeModeSnapshot = operationMode
+        if let activeCaptureSessionID,
+           let cache = lastSessionTranscribeCache,
+           cache.sessionID == activeCaptureSessionID,
+           Date().timeIntervalSince(cache.timestamp) < 3.0 {
+            debugTrace("transcribe dedupe reuse session=\(activeCaptureSessionID.uuidString)")
+            return cache.result
+        }
+        if let preferredLanguage {
+            sessionPreferredLanguageHint = preferredLanguage
+            liveLockedLanguage = preferredLanguage
+        }
+        setFinalizingTranscript(true)
+        defer { setFinalizingTranscript(false) }
+        debugTrace("transcribe begin mode=\(transcribeModeSnapshot.rawValue) preferred=\(preferredLanguage?.rawValue ?? "auto")")
         defer {
             if operationMode == .postRecording {
                 cleanupPostRecordingAudioFileIfNeeded()
@@ -842,37 +973,53 @@ final class SpeechToTextManager: NSObject {
            appleLiveCoordinator != nil {
             await finalizeAppleLiveSessionIfNeeded()
         }
-        debugLogRuntimeConfiguration(reason: "final_transcribe")
+        debugLogRuntimeConfiguration(reason: "final_transcribe", modeOverride: transcribeModeSnapshot)
         let preferredEngine = preferredFinalTranscriptionEngine()
         debugLogEngineSelection(
             phase: "final_transcribe",
             engine: preferredEngine,
-            detail: "mode=\(operationMode.rawValue) preferredLanguage=\(preferredLanguage?.rawValue ?? "auto")"
+            detail: "mode=\(transcribeModeSnapshot.rawValue) preferredLanguage=\(preferredLanguage?.rawValue ?? "auto") analyzer_gate=\(speechAnalyzerGateReason)"
         )
+        let finalResult: (text: String, language: SupportedLanguage)
         switch preferredEngine {
         case .speechAnalyzer:
             do {
                 let analyzerResult = try await transcribeWithSpeechAnalyzer(preferredLanguage: preferredLanguage)
                 if analyzerResult.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+                    finalResult = try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+                    break
                 }
-                return analyzerResult
+                finalResult = analyzerResult
             } catch {
                 if operationMode == .postRecording {
-                    return try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+                    finalResult = try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+                    break
                 }
                 if shouldDisableSpeechAnalyzer(for: error) {
                     hasDisabledSpeechAnalyzerForSession = true
                     publishBackendStatus()
-                    return try await transcribeWithDictationTranscriber(preferredLanguage: preferredLanguage)
+                    debugTrace("speech_analyzer_final disable_for_session reason=\(error.localizedDescription)")
+                    finalResult = try await transcribeWithDictationTranscriber(preferredLanguage: preferredLanguage)
+                    break
                 }
-                throw error
+                debugTrace("speech_analyzer_final transient_error fallback=speech_recognizer reason=\(error.localizedDescription)")
+                finalResult = try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+                break
             }
         case .dictationTranscriber:
-            return try await transcribeWithDictationTranscriber(preferredLanguage: preferredLanguage)
+            finalResult = try await transcribeWithDictationTranscriber(preferredLanguage: preferredLanguage)
         case .speechRecognizer:
-            return try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+            finalResult = try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
         }
+        debugTrace("transcribe end mode=\(transcribeModeSnapshot.rawValue) lang=\(finalResult.language.rawValue) chars=\(finalResult.text.count) text=\"\(logPreview(finalResult.text))\"")
+        if let activeCaptureSessionID {
+            lastSessionTranscribeCache = SessionTranscribeCache(
+                sessionID: activeCaptureSessionID,
+                result: finalResult,
+                timestamp: Date()
+            )
+        }
+        return finalResult
     }
 
     /// Lightweight partial transcription for live preview while recording.
@@ -882,55 +1029,97 @@ final class SpeechToTextManager: NSObject {
         maxAudioSeconds: Double = 8.0,
         minimumAudioSeconds: Double = 0.8
     ) async throws -> LivePartialResult? {
+        if getFinalizingTranscript() { return nil }
+        if let preferredLanguage {
+            sessionPreferredLanguageHint = preferredLanguage
+            liveLockedLanguage = preferredLanguage
+        }
         debugLogRuntimeConfiguration(reason: "live_partial")
         let preferredEngine = preferredLivePartialEngine()
         debugLogEngineSelection(
             phase: "live_partial",
             engine: preferredEngine,
-            detail: "mode=\(operationMode.rawValue) preferredLanguage=\(preferredLanguage?.rawValue ?? "auto")"
+            detail: "mode=\(operationMode.rawValue) preferredLanguage=\(preferredLanguage?.rawValue ?? "auto") analyzer_gate=\(speechAnalyzerGateReason)"
         )
 
-        if #available(iOS 26.0, *),
-           useAdvancedAppleLiveTranscribers {
-            // Apple path: use one continuous analyzer session and read snapshots,
-            // instead of re-transcribing rolling windows every tick.
-            if appleLiveCoordinator == nil {
-                await startAppleLiveSessionIfNeeded()
+        if #available(iOS 26.0, *) {
+            let useAdvancedStream = useAdvancedAppleLiveTranscribers
+            if useAdvancedStream {
+                // Apple path: use one continuous analyzer session and read snapshots,
+                // instead of re-transcribing rolling windows every tick.
+                if appleLiveCoordinator == nil {
+                    await startAppleLiveSessionIfNeeded()
+                }
+                let result = latestAppleLivePartialResult(preferredLanguage: preferredLanguage)
+                if let result {
+                    advancedLiveStreamNoResultStreak = 0
+                    return publishLivePartialResultIfMeaningful(result, phase: "live_partial_stream")
+                } else {
+                    advancedLiveStreamNoResultStreak += 1
+                    let liveElapsed = liveCaptureStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                    if liveElapsed < advancedLiveStreamStartupGraceSeconds {
+                        // Dictation stream frequently needs a short warm-up; avoid noisy
+                        // early fallback churn before first stream hypotheses arrive.
+                        return nil
+                    }
+                    debugTrace("live_partial stream_unavailable fallback=windowed_partial reason=no_stream_result")
+                    if advancedLiveStreamNoResultStreak >= advancedLiveStreamNoResultDisableThreshold,
+                       liveElapsed >= advancedLiveStreamNoResultMinimumLiveSeconds,
+                       !hasDisabledAdvancedLiveStreamForSession {
+                        hasDisabledAdvancedLiveStreamForSession = true
+                        debugTrace(
+                            "live_stream disabled_for_session reason=no_stream_result_streak count=\(advancedLiveStreamNoResultStreak) live_s=\(String(format: "%.2f", liveElapsed))"
+                        )
+                    }
+                }
             }
-            return latestAppleLivePartialResult(preferredLanguage: preferredLanguage)
+            if canUseSpeechAnalyzer {
+                debugTrace("live_partial stream_unavailable fallback=windowed_speech_analyzer")
+            }
         }
 
         switch preferredEngine {
         case .speechAnalyzer:
             do {
-                return try await transcribePartialCurrentBufferWithSpeechAnalyzer(
+                let result = try await transcribePartialCurrentBufferWithSpeechAnalyzer(
                     preferredLanguage: preferredLanguage,
                     maxAudioSeconds: maxAudioSeconds,
                     minimumAudioSeconds: minimumAudioSeconds
                 )
+                return publishLivePartialResultIfMeaningful(result, phase: "speech_analyzer_partial")
             } catch {
                 if shouldDisableSpeechAnalyzer(for: error) {
                     hasDisabledSpeechAnalyzerForSession = true
                     publishBackendStatus()
-                    return try await transcribePartialCurrentBufferWithSpeechRecognizer(
+                    debugTrace("speech_analyzer_partial disable_for_session reason=\(error.localizedDescription)")
+                    let result = try await transcribePartialCurrentBufferWithSpeechRecognizer(
                         preferredLanguage: preferredLanguage,
                         maxAudioSeconds: maxAudioSeconds,
                         minimumAudioSeconds: minimumAudioSeconds
                     )
+                    return publishLivePartialResultIfMeaningful(result, phase: "speech_recognizer_partial_fallback")
                 }
-                throw error
+                debugTrace("speech_analyzer_partial transient_error fallback=speech_recognizer reason=\(error.localizedDescription)")
+                let result = try await transcribePartialCurrentBufferWithSpeechRecognizer(
+                    preferredLanguage: preferredLanguage,
+                    maxAudioSeconds: maxAudioSeconds,
+                    minimumAudioSeconds: minimumAudioSeconds
+                )
+                return publishLivePartialResultIfMeaningful(result, phase: "speech_recognizer_partial_fallback")
             }
         case .dictationTranscriber:
-            return latestAppleLivePartialResult(preferredLanguage: preferredLanguage)
+            let result = latestAppleLivePartialResult(preferredLanguage: preferredLanguage)
+            return publishLivePartialResultIfMeaningful(result, phase: "dictation_partial")
         case .speechRecognizer:
-            return try await transcribePartialCurrentBufferWithSpeechRecognizer(
+            let result = try await transcribePartialCurrentBufferWithSpeechRecognizer(
                 preferredLanguage: preferredLanguage,
                 maxAudioSeconds: maxAudioSeconds,
                 minimumAudioSeconds: minimumAudioSeconds
             )
+            return publishLivePartialResultIfMeaningful(result, phase: "speech_recognizer_partial")
         }
     }
-    
+
     private func beginLivePartialDecodeIfPossible() async -> Bool {
         await liveDecodeCoordinator.tryBegin(now: Date())
     }
@@ -952,6 +1141,7 @@ final class SpeechToTextManager: NSObject {
         postRecordingAudioFileURL = fileURL
         postRecordingAudioFileFinalized = false
         postRecordingFileLock.unlock()
+        debugTrace("post_recording file_opened path=\(fileURL.lastPathComponent) sample_rate=\(Int(format.sampleRate)) channels=\(format.channelCount)")
     }
 
     private func appendPostRecordingBufferIfNeeded(_ buffer: AVAudioPCMBuffer) {
@@ -978,6 +1168,7 @@ final class SpeechToTextManager: NSObject {
         postRecordingFileLock.unlock()
         guard !alreadyFinalized else { return }
         guard let fileURL else { return }
+        debugTrace("post_recording file_finalize path=\(fileURL.lastPathComponent)")
         _ = try? AVAudioFile(forReading: fileURL)
     }
 
@@ -1035,11 +1226,13 @@ final class SpeechToTextManager: NSObject {
             finalizePostRecordingAudioFileIfNeeded()
             if let postAudio = try loadPostRecordingAudioSamplesIfAvailable(),
                !postAudio.isEmpty {
+                debugTrace("final_audio source=post_recording_file samples=\(postAudio.count) audio_s=\(String(format: "%.2f", Double(postAudio.count) / targetSampleRate))")
                 return postAudio
             }
         }
         let audio = snapshotAudioBuffer()
         guard !audio.isEmpty else { throw STTError.emptyRecording }
+        debugTrace("final_audio source=live_buffer samples=\(audio.count) audio_s=\(String(format: "%.2f", Double(audio.count) / targetSampleRate))")
         return audio
     }
 
@@ -1070,6 +1263,7 @@ final class SpeechToTextManager: NSObject {
         do {
             if FileManager.default.fileExists(atPath: fileURL.path) {
                 try FileManager.default.removeItem(at: fileURL)
+                debugTrace("post_recording file_cleanup path=\(fileURL.lastPathComponent)")
             }
         } catch {
         }
@@ -1108,9 +1302,6 @@ final class SpeechToTextManager: NSObject {
     
     private func preferredLivePartialEngine() -> TranscriptionEngine {
         if #available(iOS 26.0, *) {
-            if !useAdvancedAppleLiveTranscribers {
-                return .speechRecognizer
-            }
             return canUseSpeechAnalyzer ? .speechAnalyzer : .speechRecognizer
         }
         return .speechRecognizer
@@ -1121,14 +1312,21 @@ final class SpeechToTextManager: NSObject {
         guard !hasDisabledSpeechAnalyzerForSession else { return false }
         guard #available(iOS 26.0, *) else { return false }
         guard !isAppleAdvancedPathQuarantined() else { return false }
-        appleCapabilityLock.lock()
-        let enabled = advancedAppleTranscriberCapable
-        appleCapabilityLock.unlock()
-        return enabled
+        // SpeechAnalyzer availability must not be coupled to advanced live-stream
+        // opt-in/capability (SpeechTranscriber-specific gate).
+        return true
     }
 
     private var canUseSpeechAnalyzer: Bool {
         canAttemptSpeechAnalyzer
+    }
+
+    private var speechAnalyzerGateReason: String {
+        if selectedModelProvider != .appleModels { return "provider_not_apple_models" }
+        if hasDisabledSpeechAnalyzerForSession { return "disabled_for_session" }
+        if #unavailable(iOS 26.0) { return "ios_below_26" }
+        if isAppleAdvancedPathQuarantined() { return "advanced_path_quarantined" }
+        return "available"
     }
     
     private func transcribeWithSpeechAnalyzer(preferredLanguage: SupportedLanguage?) async throws -> (text: String, language: SupportedLanguage) {
@@ -1143,7 +1341,7 @@ final class SpeechToTextManager: NSObject {
 
         if isListening { stopListening() }
         let audio = try await finalAudioForTranscriptionAsync()
-        let localeHint = speechAnalyzerLocaleHint(for: preferredLanguage)
+        let localeHint = speechAnalyzerLocaleHint(for: effectiveSessionLanguage(preferredLanguage: preferredLanguage))
         let engine = SpeechAnalyzerTranscriptionEngine()
         let audioSeconds = Double(audio.count) / targetSampleRate
         debugLogEngineSelection(
@@ -1185,7 +1383,7 @@ final class SpeechToTextManager: NSObject {
     private func transcribeWithSpeechRecognizer(preferredLanguage: SupportedLanguage?) async throws -> (text: String, language: SupportedLanguage) {
         if isListening { stopListening() }
         let audio = try await finalAudioForTranscriptionAsync()
-        let languageHint = preferredLanguage ?? liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+        let languageHint = effectiveSessionLanguage(preferredLanguage: preferredLanguage)
         let localeHint = speechAnalyzerLocaleHint(for: languageHint)
         let engine = SpeechRecognizerTranscriptionEngine()
         debugLogEngineSelection(
@@ -1196,7 +1394,8 @@ final class SpeechToTextManager: NSObject {
         let output = try await engine.transcribe(
             audio: audio,
             sampleRate: targetSampleRate,
-            localeHint: localeHint
+            localeHint: localeHint,
+            timeoutInterval: nil
         )
         let resolvedLanguage = supportedLanguage(from: output.locale, fallback: languageHint)
         lastLiveResolvedLanguage = resolvedLanguage
@@ -1224,7 +1423,7 @@ final class SpeechToTextManager: NSObject {
         let windowStartSample = max(0, fullAudio.count - audioWindow.count)
         let windowStartTime = TimeInterval(windowStartSample) / targetSampleRate
         let windowEndTime = TimeInterval(fullAudio.count) / targetSampleRate
-        let languageHint = preferredLanguage ?? liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+        let languageHint = effectiveSessionLanguage(preferredLanguage: preferredLanguage)
         let localeHint = speechAnalyzerLocaleHint(for: languageHint)
         let engine = SpeechAnalyzerTranscriptionEngine()
         let audioSeconds = Double(audioWindow.count) / targetSampleRate
@@ -1244,14 +1443,16 @@ final class SpeechToTextManager: NSObject {
         guard !text.isEmpty else { return nil }
 
         let resolvedLanguage = supportedLanguage(from: output.locale, fallback: languageHint)
-        if pendingLiveLockLanguage == resolvedLanguage {
-            pendingLiveLockConfirmations += 1
-        } else {
-            pendingLiveLockLanguage = resolvedLanguage
-            pendingLiveLockConfirmations = 1
-        }
-        if pendingLiveLockConfirmations >= liveLanguageLockConfirmationsRequired {
-            liveLockedLanguage = resolvedLanguage
+        if sessionPreferredLanguageHint == nil {
+            if pendingLiveLockLanguage == resolvedLanguage {
+                pendingLiveLockConfirmations += 1
+            } else {
+                pendingLiveLockLanguage = resolvedLanguage
+                pendingLiveLockConfirmations = 1
+            }
+            if pendingLiveLockConfirmations >= liveLanguageLockConfirmationsRequired {
+                liveLockedLanguage = resolvedLanguage
+            }
         }
         lastLiveResolvedLanguage = resolvedLanguage
         await liveDecodeCoordinator.markTextEmitted()
@@ -1294,7 +1495,7 @@ final class SpeechToTextManager: NSObject {
         let windowStartSample = max(0, fullAudio.count - audioWindow.count)
         let windowStartTime = TimeInterval(windowStartSample) / targetSampleRate
         let windowEndTime = TimeInterval(fullAudio.count) / targetSampleRate
-        let languageHint = preferredLanguage ?? liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+        let languageHint = effectiveSessionLanguage(preferredLanguage: preferredLanguage)
         let localeHint = speechAnalyzerLocaleHint(for: languageHint)
         let engine = SpeechRecognizerTranscriptionEngine()
         debugLogEngineSelection(
@@ -1305,20 +1506,23 @@ final class SpeechToTextManager: NSObject {
         let output = try await engine.transcribe(
             audio: audioWindow,
             sampleRate: targetSampleRate,
-            localeHint: localeHint
+            localeHint: localeHint,
+            timeoutInterval: 8.0
         )
         let rawText = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawText.isEmpty else { return nil }
 
         let resolvedLanguage = supportedLanguage(from: output.locale, fallback: languageHint)
-        if pendingLiveLockLanguage == resolvedLanguage {
-            pendingLiveLockConfirmations += 1
-        } else {
-            pendingLiveLockLanguage = resolvedLanguage
-            pendingLiveLockConfirmations = 1
-        }
-        if pendingLiveLockConfirmations >= liveLanguageLockConfirmationsRequired {
-            liveLockedLanguage = resolvedLanguage
+        if sessionPreferredLanguageHint == nil {
+            if pendingLiveLockLanguage == resolvedLanguage {
+                pendingLiveLockConfirmations += 1
+            } else {
+                pendingLiveLockLanguage = resolvedLanguage
+                pendingLiveLockConfirmations = 1
+            }
+            if pendingLiveLockConfirmations >= liveLanguageLockConfirmationsRequired {
+                liveLockedLanguage = resolvedLanguage
+            }
         }
         lastLiveResolvedLanguage = resolvedLanguage
         await liveDecodeCoordinator.markTextEmitted()
@@ -1461,9 +1665,9 @@ final class SpeechToTextManager: NSObject {
             || message.contains("unsupported locale") {
             return true
         }
-        // In live usage, any recurring SpeechAnalyzer runtime error should
-        // fail open to SpeechRecognizer for this run instead of spamming retries.
-        return true
+        // Keep analyzer enabled for transient runtime failures
+        // (for example temporary locale/session allocation pressure).
+        return false
     }
 
     private func ensureSpeechAnalyzerReadyForUse() async -> Bool {
@@ -1563,14 +1767,9 @@ final class SpeechToTextManager: NSObject {
 
     private func speechAnalyzerLocaleHint(for language: SupportedLanguage?) -> Locale? {
         guard let language else { return nil }
-        switch language {
-        case .english:
-            return Locale(identifier: "en-US")
-        case .spanish:
-            return Locale(identifier: "es-ES")
-        case .french:
-            return Locale(identifier: "fr-FR")
-        }
+        // Use a canonical language-only locale to avoid region churn (fr-FR/fr-CA/etc.)
+        // that can trigger Speech locale allocation limits.
+        return Locale(identifier: language.rawValue)
     }
 
     private func supportedLanguage(from locale: Locale, fallback: SupportedLanguage?) -> SupportedLanguage {
@@ -1581,13 +1780,131 @@ final class SpeechToTextManager: NSObject {
         return fallback ?? preferredDeviceSupportedLanguage() ?? .english
     }
 
-    private func debugLogRuntimeConfiguration(reason: String) {
+    private func effectiveSessionLanguage(preferredLanguage: SupportedLanguage?) -> SupportedLanguage {
+        preferredLanguage
+            ?? sessionPreferredLanguageHint
+            ?? liveLockedLanguage
+            ?? lastLiveResolvedLanguage
+            ?? preferredDeviceSupportedLanguage()
+            ?? .english
+    }
+
+    private func debugLogRuntimeConfiguration(reason: String, modeOverride: OperationMode? = nil) {
+        let mode = modeOverride ?? operationMode
+        debugTrace("runtime reason=\(reason) mode=\(mode.rawValue) provider=\(selectedModelProvider.rawValue)")
     }
 
     private func debugLogEngineSelection(phase: String, engine: TranscriptionEngine, detail: String) {
+        debugTrace("engine phase=\(phase) selected=\(engine.rawValue) detail=\(detail)")
     }
 
     private func logDetectedLanguage(stage: String, language: SupportedLanguage) {
+        debugTrace("language stage=\(stage) value=\(language.rawValue)")
+    }
+
+    private func logLivePartialResultIfPresent(_ result: LivePartialResult?, phase: String) {
+        guard let result else { return }
+        debugTrace(
+            "live_output phase=\(phase) lang=\(result.language.rawValue) window=\(String(format: "%.2f", result.windowStartTime))-\(String(format: "%.2f", result.windowEndTime)) chars=\(result.text.count) text=\"\(logPreview(result.text))\""
+        )
+    }
+
+    private func publishLivePartialResultIfMeaningful(_ result: LivePartialResult?, phase: String) -> LivePartialResult? {
+        guard let result else { return nil }
+        let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let now = Date()
+        if lastPublishedLivePartialText.isEmpty,
+           result.windowEndTime < firstLivePartialMinimumWindowEnd,
+           trimmed.count < firstLivePartialMinimumChars {
+            debugTrace(
+                "live_output suppress reason=early_warmup phase=\(phase) window_end=\(String(format: "%.2f", result.windowEndTime)) chars=\(trimmed.count)"
+            )
+            return nil
+        }
+        if !lastPublishedLivePartialText.isEmpty {
+            let sinceLastEmission = now.timeIntervalSince(lastPublishedLivePartialAt)
+            let windowAdvance = result.windowEndTime - lastPublishedLivePartialWindowEndTime
+            let charGrowth = max(0, trimmed.count - lastPublishedLivePartialText.count)
+            let punctuationAdvance = hasTerminalPunctuation(trimmed) && !hasTerminalPunctuation(lastPublishedLivePartialText)
+            let sameTextAndWindow = trimmed == lastPublishedLivePartialText && abs(windowAdvance) < 0.05
+            let meaningfulAdvance = charGrowth >= livePartialEmitMinimumCharAdvance
+                || windowAdvance >= livePartialEmitMinimumWindowAdvance
+                || punctuationAdvance
+            let minorWindowMovement = windowAdvance < 0.45
+            let sameWindowTrack = result.windowStartTime <= (lastPublishedLivePartialWindowStartTime + 0.20)
+            let heavyRewrite = trimmed.count + 12 < lastPublishedLivePartialText.count
+            let streamShortRewrite = phase == "live_partial_stream"
+                && windowAdvance < 1.20
+                && trimmed.count + 6 < lastPublishedLivePartialText.count
+
+            if sameTextAndWindow {
+                debugTrace("live_output suppress reason=duplicate phase=\(phase)")
+                return nil
+            }
+            if streamShortRewrite {
+                debugTrace(
+                    "live_output suppress reason=stream_short_rewrite phase=\(phase) prev_chars=\(lastPublishedLivePartialText.count) new_chars=\(trimmed.count)"
+                )
+                return nil
+            }
+            if sameWindowTrack && minorWindowMovement && heavyRewrite {
+                debugTrace(
+                    "live_output suppress reason=unstable_rewrite phase=\(phase) prev_chars=\(lastPublishedLivePartialText.count) new_chars=\(trimmed.count)"
+                )
+                return nil
+            }
+            if sinceLastEmission < livePartialEmitMinimumInterval && !meaningfulAdvance {
+                debugTrace(
+                    "live_output suppress reason=throttled phase=\(phase) dt=\(String(format: "%.2f", sinceLastEmission)) chars=+\(charGrowth)"
+                )
+                return nil
+            }
+        }
+
+        lastPublishedLivePartialText = trimmed
+        lastPublishedLivePartialWindowStartTime = result.windowStartTime
+        lastPublishedLivePartialWindowEndTime = result.windowEndTime
+        lastPublishedLivePartialAt = now
+        logLivePartialResultIfPresent(result, phase: phase)
+        return result
+    }
+
+    private func hasTerminalPunctuation(_ text: String) -> Bool {
+        guard let last = text.unicodeScalars.last else { return false }
+        return CharacterSet(charactersIn: ".!?;:").contains(last)
+    }
+
+    private func resetLivePartialOutputState() {
+        lastPublishedLivePartialText = ""
+        lastPublishedLivePartialWindowStartTime = 0
+        lastPublishedLivePartialWindowEndTime = 0
+        lastPublishedLivePartialAt = .distantPast
+    }
+
+    private func isLiveStreamTextLanguageConsistent(_ text: String, expected: SupportedLanguage?) -> Bool {
+        guard expected != nil else { return true }
+
+        // Do not reject short/incremental live transcription.
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 20 else { return true }
+
+        // Diagnostic-only guard: language consistency must not decide
+        // engine routing without a true confidence API.
+        return true
+    }
+
+    private func logPreview(_ text: String, max: Int = 120) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
+        guard trimmed.count > max else { return trimmed }
+        let idx = trimmed.index(trimmed.startIndex, offsetBy: max)
+        return String(trimmed[..<idx]) + "..."
+    }
+
+    private func debugTrace(_ message: String) {
+#if DEBUG
+        print("[STT_TRACE][SpeechToTextManager] \(message)")
+#endif
     }
 
     @objc
@@ -1890,23 +2207,22 @@ final class AppleLiveTranscriptionCoordinator {
     private func resolveEngine(localeHint: Locale?, sessionID: UUID) async throws -> EngineSelection {
         let preferred = localeHint ?? Locale.current
 
-        // Strict preference: use SpeechTranscriber whenever available and locale-supported.
+        // Live path must prefer DictationTranscriber to match Apple's live dictation behavior.
+        if let locale = await DictationTranscriber.supportedLocale(equivalentTo: preferred) {
+            return EngineSelection(
+                engine: .dictationTranscriber,
+                locale: locale,
+                reason: "Preferred live path: DictationTranscriber.supportedLocale(equivalentTo:)",
+                sessionID: sessionID
+            )
+        }
+
         if SpeechTranscriber.isAvailable,
            let locale = await SpeechTranscriber.supportedLocale(equivalentTo: preferred) {
             return EngineSelection(
                 engine: .speechTranscriber,
                 locale: locale,
-                reason: "Strict preference: SpeechTranscriber.supportedLocale(equivalentTo:)",
-                sessionID: sessionID
-            )
-        }
-
-
-        if let locale = await DictationTranscriber.supportedLocale(equivalentTo: preferred) {
-            return EngineSelection(
-                engine: .dictationTranscriber,
-                locale: locale,
-                reason: "SpeechTranscriber unavailable/unsupported; fallback DictationTranscriber.supportedLocale(equivalentTo:)",
+                reason: "DictationTranscriber unsupported; fallback SpeechTranscriber.supportedLocale(equivalentTo:)",
                 sessionID: sessionID
             )
         }

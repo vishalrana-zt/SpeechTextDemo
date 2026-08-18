@@ -92,6 +92,7 @@ struct RecordScreen: View {
     @State private var deferredTransitionStatusTask: Task<Void, Never>?
     @State private var recordingUITimerTask: Task<Void, Never>?
     @State private var displayedRecordingSeconds: Int = 0
+    @State private var stopTapCoolingDown = false
 
     init(
         autoStartOnAppear: Bool = false,
@@ -128,9 +129,16 @@ struct RecordScreen: View {
 
                 ZStack(alignment: .leading) {
                     if isListening {
-                        Text(formatDuration(seconds: displayedRecordingSeconds))
-                            .font(.title2.monospacedDigit().weight(.bold))
-                            .foregroundStyle(.red)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(formatDuration(seconds: displayedRecordingSeconds))
+                                .font(.title2.monospacedDigit().weight(.bold))
+                                .foregroundStyle(.red)
+                            if !hasLoggedFirstLiveText {
+                                Text("Listening…")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                         .transition(.opacity)
                     } else if isTranscribing || ((isAutoStartingRecording || isStoppingRecording) && showDeferredTransitionStatus) {
                         HStack(spacing: 8) {
@@ -207,7 +215,11 @@ struct RecordScreen: View {
                             )
                     )
                 }
-                .allowsHitTesting(!(isTranscribing || isAutoStartingRecording || isStoppingRecording) && !isRecordingTransitionInFlight)
+                .allowsHitTesting(
+                    !(isTranscribing || isAutoStartingRecording || isStoppingRecording)
+                        && !isRecordingTransitionInFlight
+                        && !stopTapCoolingDown
+                )
                 .animation(phaseAnimation, value: uiPhase)
                 .animation(phaseAnimation, value: showDeferredTransitionStatus)
             }
@@ -453,6 +465,7 @@ struct RecordScreen: View {
                 do {
                     self.manager.stopListening()
                     try self.manager.startListening(
+                        preferredLanguage: self.preferredLanguage,
                         autoStopOnSilence: false,
                         silenceDuration: 1.0,
                         silenceThreshold: 0.003
@@ -480,6 +493,12 @@ struct RecordScreen: View {
 
     @MainActor
     private func handleStopTapped() {
+        guard !stopTapCoolingDown else { return }
+        stopTapCoolingDown = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            stopTapCoolingDown = false
+        }
         let currentDuration = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
         if currentDuration < minimumRecordingDuration {
             return
@@ -613,7 +632,7 @@ struct RecordScreen: View {
             userInfo: [NSLocalizedDescriptionKey: "Final transcription timed out."]
         )
 
-        let decodeTask = Task.detached(priority: .userInitiated) { [manager, preferredLanguage] in
+        let decodeTask = Task(priority: .userInitiated) { [manager, preferredLanguage] in
             try await manager.transcribe(preferredLanguage: preferredLanguage)
         }
 

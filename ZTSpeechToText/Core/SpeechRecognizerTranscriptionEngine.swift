@@ -37,7 +37,8 @@ final class SpeechRecognizerTranscriptionEngine {
     func transcribe(
         audio: [Float],
         sampleRate: Double,
-        localeHint: Locale?
+        localeHint: Locale?,
+        timeoutInterval: TimeInterval? = 8.0
     ) async throws -> SpeechRecognizerTranscriptionOutput {
 #if targetEnvironment(simulator)
         throw EngineError.simulatorNotSupported
@@ -94,17 +95,19 @@ final class SpeechRecognizerTranscriptionEngine {
                 }
             }
 
-            // Prevent long-running recognizer passes from stalling live UI updates.
-            Task(priority: .utility) {
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
-                finish {
-                    task?.cancel()
-                    let timeoutError = NSError(
-                        domain: "SpeechRecognizerTranscriptionEngine",
-                        code: -1001,
-                        userInfo: [NSLocalizedDescriptionKey: "Speech recognizer partial timed out."]
-                    )
-                    continuation.resume(throwing: timeoutError)
+            if let timeoutInterval, timeoutInterval > 0 {
+                // Prevent long-running recognizer passes from stalling live UI updates.
+                Task(priority: .utility) {
+                    try? await Task.sleep(nanoseconds: UInt64(timeoutInterval * 1_000_000_000))
+                    finish {
+                        task?.cancel()
+                        let timeoutError = NSError(
+                            domain: "SpeechRecognizerTranscriptionEngine",
+                            code: -1001,
+                            userInfo: [NSLocalizedDescriptionKey: "Speech recognizer request timed out."]
+                        )
+                        continuation.resume(throwing: timeoutError)
+                    }
                 }
             }
         }

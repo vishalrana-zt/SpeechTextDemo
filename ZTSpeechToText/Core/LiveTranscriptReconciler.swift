@@ -210,7 +210,7 @@ struct LiveTranscriptReconciler {
         for segment in segments {
             output = stitch(left: output, right: segment.text)
         }
-        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return collapseRepeatedPhrases(in: output.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func join(committedText: String, provisionalText: String) -> String {
@@ -324,6 +324,54 @@ struct LiveTranscriptReconciler {
             withTemplate: " "
         )
         return normalizedWhitespace.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func collapseRepeatedPhrases(in text: String) -> String {
+        let words = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard words.count >= 6 else { return text }
+
+        var collapsed: [String] = []
+        var index = 0
+
+        while index < words.count {
+            var consumed = false
+            let maxChunkSize = min(10, (words.count - index) / 2)
+
+            if maxChunkSize >= 2 {
+                for chunkSize in stride(from: maxChunkSize, through: 2, by: -1) {
+                    let firstStart = index
+                    let firstEnd = index + chunkSize
+                    let firstChunk = Array(words[firstStart..<firstEnd]).map(normalizeWord)
+                    guard !firstChunk.allSatisfy({ $0.isEmpty }) else { continue }
+
+                    var repeatCount = 1
+                    while firstEnd + (repeatCount - 1) * chunkSize + chunkSize <= words.count {
+                        let nextStart = firstEnd + (repeatCount - 1) * chunkSize
+                        let nextEnd = nextStart + chunkSize
+                        let nextChunk = Array(words[nextStart..<nextEnd]).map(normalizeWord)
+                        if nextChunk == firstChunk {
+                            repeatCount += 1
+                        } else {
+                            break
+                        }
+                    }
+
+                    if repeatCount > 1 {
+                        collapsed.append(contentsOf: words[firstStart..<firstEnd])
+                        index = firstEnd + (repeatCount - 1) * chunkSize
+                        consumed = true
+                        break
+                    }
+                }
+            }
+
+            if !consumed {
+                collapsed.append(words[index])
+                index += 1
+            }
+        }
+
+        return collapsed.joined(separator: " ")
     }
 
     private func stableTextCommitChunk(previous: String, current: String) -> String? {

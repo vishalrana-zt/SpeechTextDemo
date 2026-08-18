@@ -66,16 +66,25 @@ final class SpeechAnalyzerTranscriptionEngine {
                 let candidate = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !candidate.isEmpty {
                     latestText = candidate
-                    if cumulativeText.isEmpty {
-                        cumulativeText = candidate
-                    } else if candidate == cumulativeText || cumulativeText.hasSuffix(candidate) {
-                        continue
-                    } else if candidate.hasPrefix(cumulativeText) {
-                        cumulativeText = candidate
-                    } else if cumulativeText.hasPrefix(candidate) {
-                        continue
+                    if preset == .progressiveTranscription {
+                        // Progressive live hypotheses are typically full-window rewrites.
+                        // Prefer latest/best replacement over cumulative stitching to
+                        // avoid repeated phrase blow-ups in live partial text.
+                        if cumulativeText.isEmpty || candidate.count >= cumulativeText.count || candidate.hasPrefix(cumulativeText) {
+                            cumulativeText = candidate
+                        }
                     } else {
-                        cumulativeText = stitch(left: cumulativeText, right: candidate)
+                        if cumulativeText.isEmpty {
+                            cumulativeText = candidate
+                        } else if candidate == cumulativeText || cumulativeText.hasSuffix(candidate) {
+                            continue
+                        } else if candidate.hasPrefix(cumulativeText) {
+                            cumulativeText = candidate
+                        } else if cumulativeText.hasPrefix(candidate) {
+                            continue
+                        } else {
+                            cumulativeText = stitch(left: cumulativeText, right: candidate)
+                        }
                     }
                 }
             }
@@ -124,15 +133,30 @@ final class SpeechAnalyzerTranscriptionEngine {
     }
 
     private func resolveLocale(localeHint: Locale?) async throws -> Locale {
-        // Avoid supportedLocale(equivalentTo:) due runtime traps seen on some
-        // iOS 26 builds. Choose locale from hint/current and then supported list.
-        if let localeHint {
-            return localeHint
-        }
-
         let supportedLocales = await SpeechTranscriber.supportedLocales
         if supportedLocales.isEmpty {
             throw EngineError.unsupportedLocale
+        }
+
+        // Avoid supportedLocale(equivalentTo:) due runtime traps seen on some
+        // iOS 26 builds. Resolve by identifier/language matching against the
+        // supported list so we never try reserving an unsupported locale id.
+        if let localeHint {
+            let hintID = localeHint.identifier.lowercased()
+            if let exact = supportedLocales.first(where: { $0.identifier.lowercased() == hintID }) {
+                return exact
+            }
+            if let byPrefix = supportedLocales.first(where: {
+                $0.identifier.lowercased().hasPrefix(hintID) || hintID.hasPrefix($0.identifier.lowercased())
+            }) {
+                return byPrefix
+            }
+            if let hintLanguage = localeHint.language.languageCode?.identifier.lowercased(),
+               let byLanguage = supportedLocales.first(where: {
+                   $0.language.languageCode?.identifier.lowercased() == hintLanguage
+               }) {
+                return byLanguage
+            }
         }
 
         let current = Locale.current
@@ -164,27 +188,7 @@ final class SpeechAnalyzerTranscriptionEngine {
     }
 
     private func reserveLocaleForAssets(_ locale: Locale) async throws {
-        var candidates: [Locale] = [locale]
-        if let languageCode = locale.language.languageCode?.identifier {
-            let languageOnlyLocale = Locale(identifier: languageCode)
-            if languageOnlyLocale.identifier != locale.identifier {
-                candidates.append(languageOnlyLocale)
-            }
-        }
-
-        var lastError: Error?
-        for candidate in candidates {
-            do {
-                _ = try await AssetInventory.reserve(locale: candidate)
-                return
-            } catch {
-                lastError = error
-            }
-        }
-
-        if let lastError {
-            throw lastError
-        }
+        _ = try await AssetInventory.reserve(locale: locale)
     }
 
     private func writeAudioToTemporaryFile(audio: [Float], sampleRate: Double) throws -> URL {
