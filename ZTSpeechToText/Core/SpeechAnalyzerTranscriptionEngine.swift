@@ -48,11 +48,9 @@ final class SpeechAnalyzerTranscriptionEngine {
         preset: SpeechTranscriber.Preset
     ) async throws -> SpeechAnalyzerTranscriptionOutput {
         guard !audio.isEmpty else { throw EngineError.emptyAudio }
-        trace("start audio_s=\(String(format: "%.2f", Double(audio.count) / sampleRate)) locale_hint=\(localeHint?.identifier ?? "auto") preset=\(String(describing: preset))")
         try await ensureSpeechAuthorization()
 
         let locale = try await resolveLocale(localeHint: localeHint)
-        trace("locale_resolved=\(locale.identifier)")
         let transcriber = SpeechTranscriber(locale: locale, preset: preset)
         try await ensureAssetsReady(for: transcriber, locale: locale)
 
@@ -63,17 +61,25 @@ final class SpeechAnalyzerTranscriptionEngine {
         let file = try AVAudioFile(forReading: fileURL)
         let resultsTask = Task<String, Error> {
             var latestText = ""
-            var strongestText = ""
+            var cumulativeText = ""
             for try await result in transcriber.results {
                 let candidate = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !candidate.isEmpty {
                     latestText = candidate
-                    if candidate.count > strongestText.count {
-                        strongestText = candidate
+                    if cumulativeText.isEmpty {
+                        cumulativeText = candidate
+                    } else if candidate == cumulativeText || cumulativeText.hasSuffix(candidate) {
+                        continue
+                    } else if candidate.hasPrefix(cumulativeText) {
+                        cumulativeText = candidate
+                    } else if cumulativeText.hasPrefix(candidate) {
+                        continue
+                    } else {
+                        cumulativeText = stitch(left: cumulativeText, right: candidate)
                     }
                 }
             }
-            return strongestText.isEmpty ? latestText : strongestText
+            return cumulativeText.isEmpty ? latestText : cumulativeText
         }
 
         let lastSampleTime = try await analyzer.analyzeSequence(from: file)
@@ -84,7 +90,6 @@ final class SpeechAnalyzerTranscriptionEngine {
         }
 
         let text = try await resultsTask.value
-        trace("final_result chars=\(text.count) text=\"\(preview(text))\"")
         return SpeechAnalyzerTranscriptionOutput(text: text, locale: locale)
     }
 
@@ -205,19 +210,38 @@ final class SpeechAnalyzerTranscriptionEngine {
         return url
     }
 
-    private func trace(_ message: String) {
-#if DEBUG
-        print("[STT_TRACE][SpeechAnalyzer] \(message)")
-#else
-        _ = message
-#endif
+    private func stitch(left: String, right: String) -> String {
+        let base = left.trimmingCharacters(in: .whitespacesAndNewlines)
+        let extra = right.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !extra.isEmpty else { return base }
+        guard !base.isEmpty else { return extra }
+
+        if base == extra { return base }
+        if base.hasSuffix(extra) { return base }
+        if extra.hasPrefix(base) { return extra }
+
+        let baseWords = base.split(whereSeparator: \.isWhitespace).map(String.init)
+        let extraWords = extra.split(whereSeparator: \.isWhitespace).map(String.init)
+        let maxOverlap = min(16, min(baseWords.count, extraWords.count))
+
+        if maxOverlap > 0 {
+            for overlap in stride(from: maxOverlap, through: 1, by: -1) {
+                let baseTail = baseWords.suffix(overlap).map(normalizeWord)
+                let extraHead = extraWords.prefix(overlap).map(normalizeWord)
+                if baseTail == extraHead {
+                    let suffix = extraWords.dropFirst(overlap).joined(separator: " ")
+                    guard !suffix.isEmpty else { return base }
+                    return base + " " + suffix
+                }
+            }
+        }
+
+        return base + " " + extra
     }
 
-    private func preview(_ text: String) -> String {
-        let normalized = text.replacingOccurrences(of: "\n", with: " ")
-        if normalized.count > 120 {
-            return String(normalized.prefix(120)) + "..."
-        }
-        return normalized
+    private func normalizeWord(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .punctuationCharacters)
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
     }
 }

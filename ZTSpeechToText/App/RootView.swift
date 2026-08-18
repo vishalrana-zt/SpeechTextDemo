@@ -45,7 +45,6 @@ struct RootView: View {
     @State private var selectedLanguage: SpeechToTextManager.SupportedLanguage = RootView.defaultSupportedLanguage()
     @State private var selectedMode: CaptureMode = .liveStreaming
     @State private var isNoteEditorFocused = false
-    private let liveDebugLoggingEnabled = false
     private let bottomPanelReservedHeight: CGFloat = 60
     private let invalidTranscriptMarkers: [String] = [
         "SwiftUI.ModifiedContent<",
@@ -185,7 +184,6 @@ struct RootView: View {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard isValidTranscriptText(trimmed) else {
-            liveDebugLog("drop_invalid_final_text")
             return
         }
         let previous = noteText
@@ -195,8 +193,6 @@ struct RootView: View {
 
     private func applyLiveTranscriptPartial(_ partial: LiveTranscriptPartial) {
         guard selectedMode == .liveStreaming else { return }
-        let applyStartedAt = Date()
-
         if liveSessionID != partial.sessionID {
             liveSessionID = partial.sessionID
             liveDraftBaseText = noteText
@@ -211,26 +207,17 @@ struct RootView: View {
         }
 
         if partial.windowEndTime + 0.001 < lastAppliedLiveWindowEnd {
-            liveDebugLog("drop_stale_partial stale_window_end=\(partial.windowEndTime) last=\(lastAppliedLiveWindowEnd)")
             return
         }
 
-        liveDebugLog("root_partial window=[\(partial.windowStartTime), \(partial.windowEndTime)] segments=\(partial.segments.count)")
 
         let acceptedPreview: String
-        let committedForLog: String
-        let oldTailForLog: String
-        let newTailForLog: String
-
         if let committed = partial.committedText,
            let volatile = partial.volatileText {
             // Apple streaming path provides an explicit committed/volatile split.
             // Keep committed prefix untouched and replace only the tail.
             let committedTrimmed = committed.trimmingCharacters(in: .whitespacesAndNewlines)
             let volatileTrimmed = volatile.trimmingCharacters(in: .whitespacesAndNewlines)
-            committedForLog = committedTrimmed
-            oldTailForLog = volatileTail(from: livePreviewText, committedPrefix: committedTrimmed)
-            newTailForLog = volatileTrimmed
             let stitched = [committedTrimmed, volatileTrimmed]
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
@@ -241,9 +228,6 @@ struct RootView: View {
             let preview = renderState.renderedText
             guard !preview.isEmpty else { return }
             acceptedPreview = acceptedLivePreview(from: preview)
-            committedForLog = ""
-            oldTailForLog = ""
-            newTailForLog = ""
         }
 
         guard acceptedPreview != livePreviewText else { return }
@@ -253,7 +237,6 @@ struct RootView: View {
         if sinceLastApply < 0.16 {
             let delta = abs(acceptedPreview.count - livePreviewText.count)
             if delta < 18 {
-                liveDebugLog("drop_jitter_partial dt_ms=\(Int(sinceLastApply * 1000)) delta=\(delta)")
                 return
             }
         }
@@ -261,19 +244,14 @@ struct RootView: View {
 
         let updatedNoteText = merge(liveDraftBaseText, with: acceptedPreview)
         noteText = updatedNoteText
-        sttTrace(
-            "textview_live_apply session=\(partial.sessionID.uuidString.prefix(8)) committed_chars=\(committedForLog.count) old_tail=\"\(previewForLog(oldTailForLog))\" new_tail=\"\(previewForLog(newTailForLog))\""
-        )
         lastAppliedLiveWindowEnd = partial.windowEndTime
         lastLivePreviewAppliedAt = now
-        liveDebugLog("ui_apply_ms=\(Int(Date().timeIntervalSince(applyStartedAt) * 1000))")
     }
 
     private func commitFinalTranscript(sessionID: UUID, _ finalText: String) {
         let trimmed = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard isValidTranscriptText(trimmed) else {
-            liveDebugLog("drop_invalid_committed_text")
             return
         }
 
@@ -284,18 +262,13 @@ struct RootView: View {
         }
 
         guard sessionID == liveSessionID else {
-            liveDebugLog("drop_final_stale_session")
             return
         }
         let reconciledFinal = liveReconciler.finalize(sessionID: sessionID, finalText: trimmed) ?? trimmed
         let resolvedFinal = resolvedAppleLiveFinalTextIfNeeded(reconciledFinal)
-        liveDebugLog("final_commit=\"\(reconciledFinal)\"")
 
         let merged = merge(liveDraftBaseText, with: resolvedFinal)
         noteText = merged
-        sttTrace(
-            "textview_final_commit session=\(sessionID.uuidString.prefix(8)) chars=\(resolvedFinal.count) text=\"\(previewForLog(resolvedFinal))\""
-        )
         resetLiveDraftState()
     }
 
@@ -581,26 +554,6 @@ struct RootView: View {
         return .english
     }
 
-    private func liveDebugLog(_ message: String) {
-        guard liveDebugLoggingEnabled else { return }
-        _ = message
-    }
-
-    private func sttTrace(_ message: String) {
-#if DEBUG
-        print("[STT_TRACE][RootView] \(message)")
-#else
-        _ = message
-#endif
-    }
-
-    private func previewForLog(_ value: String) -> String {
-        let normalized = value.replacingOccurrences(of: "\n", with: " ")
-        if normalized.count > 120 {
-            return String(normalized.prefix(120)) + "..."
-        }
-        return normalized
-    }
 }
 
 private struct LiveAwareTextView: UIViewRepresentable {

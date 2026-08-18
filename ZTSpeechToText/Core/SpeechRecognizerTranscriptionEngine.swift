@@ -40,19 +40,15 @@ final class SpeechRecognizerTranscriptionEngine {
         localeHint: Locale?
     ) async throws -> SpeechRecognizerTranscriptionOutput {
 #if targetEnvironment(simulator)
-        trace("simulator_not_supported")
         throw EngineError.simulatorNotSupported
 #else
         guard !audio.isEmpty else { throw EngineError.emptyAudio }
-        trace("start audio_s=\(String(format: "%.2f", Double(audio.count) / sampleRate)) locale_hint=\(localeHint?.identifier ?? "auto")")
         try await ensureSpeechAuthorization()
 
         let locale = try resolveLocale(localeHint: localeHint)
-        trace("locale_resolved=\(locale.identifier)")
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
             throw EngineError.unavailableRecognizer
         }
-        trace("recognizer_available=true")
 
         let fileURL = try writeAudioToTemporaryFile(audio: audio, sampleRate: sampleRate)
         defer { try? FileManager.default.removeItem(at: fileURL) }
@@ -82,7 +78,6 @@ final class SpeechRecognizerTranscriptionEngine {
                             if text.isEmpty {
                                 continuation.resume(throwing: EngineError.noRecognitionResult)
                             } else {
-                                self.trace("final_result chars=\(text.count) text=\"\(self.preview(text))\"")
                                 continuation.resume(returning: SpeechRecognizerTranscriptionOutput(text: text, locale: locale))
                             }
                         }
@@ -94,7 +89,6 @@ final class SpeechRecognizerTranscriptionEngine {
                     finish {
                         task?.cancel()
                         let mapped = self.mapRecognitionError(error)
-                        self.trace("error original=\"\((error as NSError).domain)#\((error as NSError).code)\" mapped=\"\(mapped.localizedDescription)\"")
                         continuation.resume(throwing: mapped)
                     }
                 }
@@ -110,7 +104,6 @@ final class SpeechRecognizerTranscriptionEngine {
                         code: -1001,
                         userInfo: [NSLocalizedDescriptionKey: "Speech recognizer partial timed out."]
                     )
-                    self.trace("error original=\"timeout\" mapped=\"\(timeoutError.localizedDescription)\"")
                     continuation.resume(throwing: timeoutError)
                 }
             }
@@ -124,22 +117,6 @@ final class SpeechRecognizerTranscriptionEngine {
             return EngineError.unavailableRecognizer
         }
         return error
-    }
-
-    private func trace(_ message: String) {
-#if DEBUG
-        print("[STT_TRACE][SpeechRecognizer] \(message)")
-#else
-        _ = message
-#endif
-    }
-
-    private func preview(_ text: String) -> String {
-        let normalized = text.replacingOccurrences(of: "\n", with: " ")
-        if normalized.count > 120 {
-            return String(normalized.prefix(120)) + "..."
-        }
-        return normalized
     }
 
     private func ensureSpeechAuthorization() async throws {

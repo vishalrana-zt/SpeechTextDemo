@@ -150,6 +150,10 @@ final class SpeechToTextManager: NSObject {
     private var sampleBuffer: [Float] = []
     private let targetSampleRate: Double = 16_000
     private let bufferLock = NSLock()
+    private let postRecordingFileLock = NSLock()
+    private var postRecordingAudioFile: AVAudioFile?
+    private var postRecordingAudioFileURL: URL?
+    private var postRecordingAudioFileFinalized = false
     private var hasInputTapInstalled = false
 
     private var autoStopOnSilence = false
@@ -304,13 +308,11 @@ final class SpeechToTextManager: NSObject {
         if defaults.bool(forKey: Self.appleAdvancedArmedKey) {
             defaults.set(true, forKey: Self.appleAdvancedQuarantinedKey)
             defaults.set(false, forKey: Self.appleAdvancedArmedKey)
-            sttTrace("apple_advanced_path_quarantined reason=previous_unclean_exit")
         }
 #if DEBUG
         // Enable advanced Apple path testing by default on debug builds only.
         if defaults.object(forKey: Self.appleAdvancedExplicitOptInKey) == nil {
             defaults.set(true, forKey: Self.appleAdvancedExplicitOptInKey)
-            sttTrace("apple_advanced_path_opt_in defaulted=true scope=debug")
         }
 
         // Developer convenience: automatically clear quarantine on launch in debug
@@ -318,7 +320,6 @@ final class SpeechToTextManager: NSObject {
         if defaults.bool(forKey: Self.appleAdvancedQuarantinedKey) {
             defaults.set(false, forKey: Self.appleAdvancedQuarantinedKey)
             defaults.set(false, forKey: Self.appleAdvancedArmedKey)
-            sttTrace("apple_advanced_path_quarantine_cleared reason=debug_auto_clear_on_launch")
         }
 #endif
     }
@@ -348,7 +349,6 @@ final class SpeechToTextManager: NSObject {
         hasDisabledSpeechAnalyzerForSession = false
         hasValidatedSpeechAnalyzerForSession = false
         setAdvancedAppleTranscriberCapability(false, checked: false)
-        sttTrace("apple_advanced_path_quarantine_cleared reason=manual_retry")
         Task(priority: .utility) { [weak self] in
             await self?.refreshAdvancedAppleTranscriberCapabilityIfNeeded(force: true)
         }
@@ -362,7 +362,6 @@ final class SpeechToTextManager: NSObject {
         }
         guard !isAppleAdvancedPathQuarantined() else {
             setAdvancedAppleTranscriberCapability(false, checked: true)
-            sttTrace("apple_transcriber_capability enabled=false reason=quarantined_after_unclean_exit")
             publishBackendStatus()
             return
         }
@@ -377,7 +376,6 @@ final class SpeechToTextManager: NSObject {
         let runtimeCapable = isAvailable && !locales.isEmpty
         let enabled = runtimeCapable && isAdvancedApplePathExplicitlyEnabled
         setAdvancedAppleTranscriberCapability(enabled, checked: true)
-        sttTrace("apple_transcriber_capability is_available=\(isAvailable) locales=\(locales.count) explicit_opt_in=\(isAdvancedApplePathExplicitlyEnabled) enabled=\(enabled)")
         publishBackendStatus()
     }
 
@@ -594,7 +592,6 @@ final class SpeechToTextManager: NSObject {
         do {
             try session.setCategory(.record, mode: .measurement, options: .duckOthers)
             try session.setActive(true)
-            sttTrace("audio_session active=true category=\(session.category.rawValue) mode=\(session.mode.rawValue) sample_rate=\(session.sampleRate)")
         } catch {
             throw STTError.audioSessionFailure
         }
@@ -602,6 +599,9 @@ final class SpeechToTextManager: NSObject {
         bufferLock.lock()
         sampleBuffer.removeAll()
         bufferLock.unlock()
+        if operationMode != .postRecording {
+            cleanupPostRecordingAudioFileIfNeeded()
+        }
 
         let input = audioEngine.inputNode
         if hasInputTapInstalled {
@@ -616,6 +616,9 @@ final class SpeechToTextManager: NSObject {
             interleaved: false
         ), let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
             throw STTError.audioSessionFailure
+        }
+        if operationMode == .postRecording {
+            try preparePostRecordingAudioFileIfNeeded(format: targetFormat)
         }
 
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
@@ -635,6 +638,7 @@ final class SpeechToTextManager: NSObject {
             self.bufferLock.lock()
             self.sampleBuffer.append(contentsOf: frames)
             self.bufferLock.unlock()
+            self.appendPostRecordingBufferIfNeeded(outBuffer)
 
             if self.selectedModelProvider == .appleModels,
                self.useAdvancedAppleLiveTranscribers {
@@ -688,6 +692,7 @@ final class SpeechToTextManager: NSObject {
         } catch {
             input.removeTap(onBus: 0)
             hasInputTapInstalled = false
+            cleanupPostRecordingAudioFileIfNeeded()
             try? AVAudioSession.sharedInstance().setActive(false)
             throw STTError.audioSessionFailure
         }
@@ -706,6 +711,7 @@ final class SpeechToTextManager: NSObject {
             hasInputTapInstalled = false
         }
         audioEngine.stop()
+        finalizePostRecordingAudioFileIfNeeded()
         try? AVAudioSession.sharedInstance().setActive(false)
         isListening = false
 
@@ -782,12 +788,10 @@ final class SpeechToTextManager: NSObject {
             armAppleAdvancedPath()
             let coordinator = AppleLiveTranscriptionCoordinator()
             let localeHint = speechAnalyzerLocaleHint(for: liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english)
-            let selection = try await coordinator.start(localeHint: localeHint)
+            _ = try await coordinator.start(localeHint: localeHint)
             appleLiveCoordinator = coordinator
-            sttTrace("engine_selected live=\(selection.engine.rawValue) reason=\"\(selection.reason)\" locale=\(selection.locale.identifier)")
         } catch {
             disarmAppleAdvancedPath()
-            sttTrace("engine_selected live=fallback reason=\"apple_live_stream_start_failed: \(error.localizedDescription)\"")
             hasDisabledSpeechAnalyzerForSession = true
         }
     }
@@ -806,7 +810,6 @@ final class SpeechToTextManager: NSObject {
                 setAppleLiveFinalText(finalPartial.text)
             }
         } catch {
-            sttTrace("apple_live_finalize_error error=\"\(error.localizedDescription)\"")
         }
     }
 
@@ -830,6 +833,11 @@ final class SpeechToTextManager: NSObject {
     /// In live-streaming mode, this final decode is performed with the Small model
     /// for higher post-recording accuracy.
     func transcribe(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
+        defer {
+            if operationMode == .postRecording {
+                cleanupPostRecordingAudioFileIfNeeded()
+            }
+        }
         if #available(iOS 26.0, *),
            appleLiveCoordinator != nil {
             await finalizeAppleLiveSessionIfNeeded()
@@ -844,8 +852,15 @@ final class SpeechToTextManager: NSObject {
         switch preferredEngine {
         case .speechAnalyzer:
             do {
-                return try await transcribeWithSpeechAnalyzer(preferredLanguage: preferredLanguage)
+                let analyzerResult = try await transcribeWithSpeechAnalyzer(preferredLanguage: preferredLanguage)
+                if analyzerResult.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+                }
+                return analyzerResult
             } catch {
+                if operationMode == .postRecording {
+                    return try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+                }
                 if shouldDisableSpeechAnalyzer(for: error) {
                     hasDisabledSpeechAnalyzerForSession = true
                     publishBackendStatus()
@@ -926,6 +941,140 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
+    private func preparePostRecordingAudioFileIfNeeded(format: AVAudioFormat) throws {
+        guard operationMode == .postRecording else { return }
+        cleanupPostRecordingAudioFileIfNeeded()
+        let fileName = "stt-post-\(UUID().uuidString).wav"
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        let audioFile = try AVAudioFile(forWriting: fileURL, settings: format.settings)
+        postRecordingFileLock.lock()
+        postRecordingAudioFile = audioFile
+        postRecordingAudioFileURL = fileURL
+        postRecordingAudioFileFinalized = false
+        postRecordingFileLock.unlock()
+    }
+
+    private func appendPostRecordingBufferIfNeeded(_ buffer: AVAudioPCMBuffer) {
+        guard operationMode == .postRecording else { return }
+        postRecordingFileLock.lock()
+        let file = postRecordingAudioFile
+        postRecordingFileLock.unlock()
+        guard let file else { return }
+        do {
+            try file.write(from: buffer)
+        } catch {
+        }
+    }
+
+    private func finalizePostRecordingAudioFileIfNeeded() {
+        guard operationMode == .postRecording else { return }
+        postRecordingFileLock.lock()
+        let alreadyFinalized = postRecordingAudioFileFinalized
+        postRecordingAudioFile = nil
+        let fileURL = postRecordingAudioFileURL
+        if !alreadyFinalized {
+            postRecordingAudioFileFinalized = true
+        }
+        postRecordingFileLock.unlock()
+        guard !alreadyFinalized else { return }
+        guard let fileURL else { return }
+        _ = try? AVAudioFile(forReading: fileURL)
+    }
+
+    private func loadPostRecordingAudioSamplesIfAvailable() throws -> [Float]? {
+        guard operationMode == .postRecording else { return nil }
+        postRecordingFileLock.lock()
+        let fileURL = postRecordingAudioFileURL
+        postRecordingFileLock.unlock()
+        guard let fileURL else { return nil }
+
+        let file = try AVAudioFile(forReading: fileURL)
+        let sourceFormat = file.processingFormat
+        let frameCount = AVAudioFrameCount(file.length)
+        guard frameCount > 0 else { return [] }
+        guard let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frameCount) else {
+            throw STTError.audioSessionFailure
+        }
+        try file.read(into: sourceBuffer)
+
+        guard let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: targetSampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw STTError.audioSessionFailure
+        }
+
+        let outCapacity = AVAudioFrameCount(Double(sourceBuffer.frameLength) * (targetSampleRate / sourceFormat.sampleRate)) + 32
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity),
+              let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            throw STTError.audioSessionFailure
+        }
+
+        var conversionError: NSError?
+        var didProvideSourceBuffer = false
+        converter.convert(to: outputBuffer, error: &conversionError) { _, status in
+            if didProvideSourceBuffer {
+                status.pointee = .endOfStream
+                return nil
+            }
+            didProvideSourceBuffer = true
+            status.pointee = .haveData
+            return sourceBuffer
+        }
+        if let conversionError {
+            throw conversionError
+        }
+        guard let channelData = outputBuffer.floatChannelData else { return [] }
+        return Array(UnsafeBufferPointer(start: channelData[0], count: Int(outputBuffer.frameLength)))
+    }
+
+    private func finalAudioForTranscription() throws -> [Float] {
+        if operationMode == .postRecording {
+            finalizePostRecordingAudioFileIfNeeded()
+            if let postAudio = try loadPostRecordingAudioSamplesIfAvailable(),
+               !postAudio.isEmpty {
+                return postAudio
+            }
+        }
+        let audio = snapshotAudioBuffer()
+        guard !audio.isEmpty else { throw STTError.emptyRecording }
+        return audio
+    }
+
+    private func finalAudioForTranscriptionAsync() async throws -> [Float] {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else {
+                    continuation.resume(throwing: STTError.audioSessionFailure)
+                    return
+                }
+                do {
+                    continuation.resume(returning: try self.finalAudioForTranscription())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func cleanupPostRecordingAudioFileIfNeeded() {
+        postRecordingFileLock.lock()
+        postRecordingAudioFile = nil
+        let fileURL = postRecordingAudioFileURL
+        postRecordingAudioFileURL = nil
+        postRecordingAudioFileFinalized = false
+        postRecordingFileLock.unlock()
+        guard let fileURL else { return }
+        do {
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try FileManager.default.removeItem(at: fileURL)
+            }
+        } catch {
+        }
+    }
+
     /// Current captured audio duration while recording.
     /// Used by live UI scheduler to avoid ultra-early partial decode churn.
     func currentBufferedAudioSeconds() -> Double {
@@ -951,11 +1100,8 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func preferredFinalTranscriptionEngine() -> TranscriptionEngine {
-        if #available(iOS 26.0, *) {
-            if !useAdvancedAppleLiveTranscribers {
-                return .speechRecognizer
-            }
-            return canUseSpeechAnalyzer ? .speechAnalyzer : .dictationTranscriber
+        if #available(iOS 26.0, *), canUseSpeechAnalyzer {
+            return .speechAnalyzer
         }
         return .speechRecognizer
     }
@@ -965,7 +1111,7 @@ final class SpeechToTextManager: NSObject {
             if !useAdvancedAppleLiveTranscribers {
                 return .speechRecognizer
             }
-            return canUseSpeechAnalyzer ? .speechAnalyzer : .dictationTranscriber
+            return canUseSpeechAnalyzer ? .speechAnalyzer : .speechRecognizer
         }
         return .speechRecognizer
     }
@@ -973,7 +1119,12 @@ final class SpeechToTextManager: NSObject {
     private var canAttemptSpeechAnalyzer: Bool {
         guard selectedModelProvider == .appleModels else { return false }
         guard !hasDisabledSpeechAnalyzerForSession else { return false }
-        return useAdvancedAppleLiveTranscribers
+        guard #available(iOS 26.0, *) else { return false }
+        guard !isAppleAdvancedPathQuarantined() else { return false }
+        appleCapabilityLock.lock()
+        let enabled = advancedAppleTranscriberCapable
+        appleCapabilityLock.unlock()
+        return enabled
     }
 
     private var canUseSpeechAnalyzer: Bool {
@@ -991,8 +1142,7 @@ final class SpeechToTextManager: NSObject {
         }
 
         if isListening { stopListening() }
-        let audio = snapshotAudioBuffer()
-        guard !audio.isEmpty else { throw STTError.emptyRecording }
+        let audio = try await finalAudioForTranscriptionAsync()
         let localeHint = speechAnalyzerLocaleHint(for: preferredLanguage)
         let engine = SpeechAnalyzerTranscriptionEngine()
         let audioSeconds = Double(audio.count) / targetSampleRate
@@ -1034,8 +1184,7 @@ final class SpeechToTextManager: NSObject {
 
     private func transcribeWithSpeechRecognizer(preferredLanguage: SupportedLanguage?) async throws -> (text: String, language: SupportedLanguage) {
         if isListening { stopListening() }
-        let audio = snapshotAudioBuffer()
-        guard !audio.isEmpty else { throw STTError.emptyRecording }
+        let audio = try await finalAudioForTranscriptionAsync()
         let languageHint = preferredLanguage ?? liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
         let localeHint = speechAnalyzerLocaleHint(for: languageHint)
         let engine = SpeechRecognizerTranscriptionEngine()
@@ -1433,15 +1582,12 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func debugLogRuntimeConfiguration(reason: String) {
-        sttTrace("runtime reason=\(reason) mode=\(operationMode.rawValue) provider=\(selectedModelProvider.rawValue)")
     }
 
     private func debugLogEngineSelection(phase: String, engine: TranscriptionEngine, detail: String) {
-        sttTrace("engine phase=\(phase) selected=\(engine.rawValue) detail=\(detail)")
     }
 
     private func logDetectedLanguage(stage: String, language: SupportedLanguage) {
-        sttTrace("language stage=\(stage) value=\(language.rawValue)")
     }
 
     @objc
@@ -1454,22 +1600,14 @@ final class SpeechToTextManager: NSObject {
 
         switch type {
         case .began:
-            sttTrace("interruption began; stopping audio session")
             stopListening()
         case .ended:
-            sttTrace("interruption ended")
+            break
         @unknown default:
             break
         }
     }
 
-    private func sttTrace(_ message: String) {
-#if DEBUG
-        print("[STT_TRACE][SpeechToTextManager] \(message)")
-#else
-        _ = message
-#endif
-    }
 }
 
 @available(iOS 26.0, *)
@@ -1530,33 +1668,22 @@ final class AppleLiveTranscriptionCoordinator {
         hasLoggedFirstInputBuffer = false
 
         let resolved = try await resolveEngine(localeHint: localeHint, sessionID: sessionID)
-        trace("session=\(sessionID.uuidString) phase=before_input_sequence")
         let stream = AsyncStream<AnalyzerInput> { continuation in
             self.inputContinuation = continuation
         }
-        trace("session=\(sessionID.uuidString) phase=after_input_sequence")
 
         do {
             switch resolved.engine {
             case .speechTranscriber:
-                trace("session=\(sessionID.uuidString) phase=before_transcriber_init engine=speechTranscriber")
-                trace("session=\(sessionID.uuidString) phase=create_transcriber engine=speechTranscriber locale=\(resolved.locale.identifier)")
                 let preset = SpeechTranscriber.Preset(
                     transcriptionOptions: [],
                     reportingOptions: [.volatileResults, .fastResults],
                     attributeOptions: []
                 )
                 let transcriber = SpeechTranscriber(locale: resolved.locale, preset: preset)
-                trace("session=\(sessionID.uuidString) phase=after_transcriber_init engine=speechTranscriber")
-                trace("session=\(sessionID.uuidString) phase=before_asset_check engine=speechTranscriber")
-                trace("session=\(sessionID.uuidString) phase=asset_check engine=speechTranscriber")
                 try await ensureAssetsReady(module: transcriber)
-                trace("session=\(sessionID.uuidString) phase=after_asset_check engine=speechTranscriber")
 
-                trace("session=\(sessionID.uuidString) phase=before_analyzer_init engine=speechTranscriber")
-                trace("session=\(sessionID.uuidString) phase=create_analyzer engine=speechTranscriber")
                 let analyzer = SpeechAnalyzer(modules: [transcriber])
-                trace("session=\(sessionID.uuidString) phase=after_analyzer_init engine=speechTranscriber")
                 let defaultFormat = AVAudioFormat(
                     commonFormat: .pcmFormatFloat32,
                     sampleRate: 16_000,
@@ -1572,14 +1699,10 @@ final class AppleLiveTranscriptionCoordinator {
                     )
                 }
                 analyzerInputFormat = expectedFormat
-                trace("session=\(sessionID.uuidString) phase=prepare_to_analyze sample_rate=\(expectedFormat.sampleRate) channels=\(expectedFormat.channelCount)")
-                trace("session=\(sessionID.uuidString) phase=before_prepare_to_analyze")
                 try await analyzer.prepareToAnalyze(in: expectedFormat)
-                trace("session=\(sessionID.uuidString) phase=after_prepare_to_analyze")
                 self.analyzer = analyzer
                 self.latestLocale = resolved.locale
 
-                trace("session=\(sessionID.uuidString) phase=before_recognition_task engine=speechTranscriber")
                 self.resultsTask = Task(priority: .userInitiated) { [weak self] in
                     guard let self else { return }
                     do {
@@ -1595,35 +1718,18 @@ final class AppleLiveTranscriptionCoordinator {
                         }
                     } catch {
                         if self.isSessionActive(sessionID) {
-                            self.trace("session=\(sessionID.uuidString) phase=results_stream_error engine=speechTranscriber error=\"\(error.localizedDescription)\"")
                         }
                     }
                 }
-                trace("session=\(sessionID.uuidString) phase=recognition_running engine=speechTranscriber")
 
-                trace("session=\(sessionID.uuidString) phase=before_set_input_sequence")
-                trace("session=\(sessionID.uuidString) phase=set_input_sequence")
-                trace("session=\(sessionID.uuidString) phase=after_set_input_sequence")
-                trace("session=\(sessionID.uuidString) phase=before_analyzer_start")
-                trace("session=\(sessionID.uuidString) phase=analyzer_start")
                 try await analyzer.start(inputSequence: stream)
-                trace("session=\(sessionID.uuidString) phase=after_analyzer_start")
 
             case .dictationTranscriber:
-                trace("session=\(sessionID.uuidString) phase=before_transcriber_init engine=dictationTranscriber")
-                trace("session=\(sessionID.uuidString) phase=create_transcriber engine=dictationTranscriber locale=\(resolved.locale.identifier)")
                 let preset = DictationTranscriber.Preset.progressiveLongDictation
                 let transcriber = DictationTranscriber(locale: resolved.locale, preset: preset)
-                trace("session=\(sessionID.uuidString) phase=after_transcriber_init engine=dictationTranscriber")
-                trace("session=\(sessionID.uuidString) phase=before_asset_check engine=dictationTranscriber")
-                trace("session=\(sessionID.uuidString) phase=asset_check engine=dictationTranscriber")
                 try await ensureAssetsReady(module: transcriber)
-                trace("session=\(sessionID.uuidString) phase=after_asset_check engine=dictationTranscriber")
 
-                trace("session=\(sessionID.uuidString) phase=before_analyzer_init engine=dictationTranscriber")
-                trace("session=\(sessionID.uuidString) phase=create_analyzer engine=dictationTranscriber")
                 let analyzer = SpeechAnalyzer(modules: [transcriber])
-                trace("session=\(sessionID.uuidString) phase=after_analyzer_init engine=dictationTranscriber")
                 let defaultFormat = AVAudioFormat(
                     commonFormat: .pcmFormatFloat32,
                     sampleRate: 16_000,
@@ -1639,14 +1745,10 @@ final class AppleLiveTranscriptionCoordinator {
                     )
                 }
                 analyzerInputFormat = expectedFormat
-                trace("session=\(sessionID.uuidString) phase=prepare_to_analyze sample_rate=\(expectedFormat.sampleRate) channels=\(expectedFormat.channelCount)")
-                trace("session=\(sessionID.uuidString) phase=before_prepare_to_analyze")
                 try await analyzer.prepareToAnalyze(in: expectedFormat)
-                trace("session=\(sessionID.uuidString) phase=after_prepare_to_analyze")
                 self.analyzer = analyzer
                 self.latestLocale = resolved.locale
 
-                trace("session=\(sessionID.uuidString) phase=before_recognition_task engine=dictationTranscriber")
                 self.resultsTask = Task(priority: .userInitiated) { [weak self] in
                     guard let self else { return }
                     do {
@@ -1662,19 +1764,11 @@ final class AppleLiveTranscriptionCoordinator {
                         }
                     } catch {
                         if self.isSessionActive(sessionID) {
-                            self.trace("session=\(sessionID.uuidString) phase=results_stream_error engine=dictationTranscriber error=\"\(error.localizedDescription)\"")
                         }
                     }
                 }
-                trace("session=\(sessionID.uuidString) phase=recognition_running engine=dictationTranscriber")
 
-                trace("session=\(sessionID.uuidString) phase=before_set_input_sequence")
-                trace("session=\(sessionID.uuidString) phase=set_input_sequence")
-                trace("session=\(sessionID.uuidString) phase=after_set_input_sequence")
-                trace("session=\(sessionID.uuidString) phase=before_analyzer_start")
-                trace("session=\(sessionID.uuidString) phase=analyzer_start")
                 try await analyzer.start(inputSequence: stream)
-                trace("session=\(sessionID.uuidString) phase=after_analyzer_start")
             }
         } catch {
             transitionLifecycle(to: .failed, sessionID: sessionID, detail: "phase=start_failed error=\"\(error.localizedDescription)\"")
@@ -1683,7 +1777,6 @@ final class AppleLiveTranscriptionCoordinator {
         }
 
         if !hasLoggedEngineSelection {
-            trace("session=\(sessionID.uuidString) phase=engine_selected live=\(resolved.engine.rawValue) locale=\(resolved.locale.identifier) reason=\"\(resolved.reason)\"")
             hasLoggedEngineSelection = true
         }
         transitionLifecycle(to: .running, sessionID: sessionID, detail: "phase=running")
@@ -1708,16 +1801,13 @@ final class AppleLiveTranscriptionCoordinator {
             guard let self else { return }
             guard self.isSessionActive(sessionID) else { return }
             guard let inputBuffer = self.convertBufferIfNeeded(buffer, to: expectedFormat) else {
-                self.trace("session=\(sessionID.uuidString) phase=push_buffer_dropped reason=conversion_failed")
                 return
             }
             let shouldLogFirstBuffer = !self.hasLoggedFirstInputBuffer
             if shouldLogFirstBuffer {
-                self.trace("session=\(sessionID.uuidString) phase=before_first_input_buffer sample_rate=\(inputBuffer.format.sampleRate) channels=\(inputBuffer.format.channelCount)")
             }
             continuation.yield(AnalyzerInput(buffer: inputBuffer))
             if shouldLogFirstBuffer {
-                self.trace("session=\(sessionID.uuidString) phase=after_first_input_buffer")
                 self.hasLoggedFirstInputBuffer = true
             }
         }
@@ -1775,15 +1865,12 @@ final class AppleLiveTranscriptionCoordinator {
 
         if finalize, let analyzer {
             do {
-                trace("session=\(sessionID.uuidString) phase=finalize_and_finish")
                 try await analyzer.finalizeAndFinishThroughEndOfInput()
             } catch {
-                trace("session=\(sessionID.uuidString) phase=finalize_error error=\"\(error.localizedDescription)\"")
             }
         }
 
         if !finalize {
-            trace("session=\(sessionID.uuidString) phase=cancel_and_finish_now")
             await analyzer?.cancelAndFinishNow()
         }
 
@@ -1802,7 +1889,6 @@ final class AppleLiveTranscriptionCoordinator {
 
     private func resolveEngine(localeHint: Locale?, sessionID: UUID) async throws -> EngineSelection {
         let preferred = localeHint ?? Locale.current
-        trace("session=\(sessionID.uuidString) phase=availability_check preferred_locale=\(preferred.identifier)")
 
         // Strict preference: use SpeechTranscriber whenever available and locale-supported.
         if SpeechTranscriber.isAvailable,
@@ -1815,7 +1901,6 @@ final class AppleLiveTranscriptionCoordinator {
             )
         }
 
-        trace("session=\(sessionID.uuidString) phase=availability_check speech_transcriber_unavailable_or_locale_unsupported preferred=\(preferred.identifier)")
 
         if let locale = await DictationTranscriber.supportedLocale(equivalentTo: preferred) {
             return EngineSelection(
@@ -1826,7 +1911,6 @@ final class AppleLiveTranscriptionCoordinator {
             )
         }
 
-        trace("session=\(sessionID.uuidString) phase=availability_check no_supported_locale")
         throw NSError(
             domain: "AppleLiveTranscriptionCoordinator",
             code: 1,
@@ -1949,7 +2033,6 @@ final class AppleLiveTranscriptionCoordinator {
         lifecycleState = next
         activeSessionID = (next == .idle) ? nil : sessionID
         lifecycleLock.unlock()
-        trace("session=\(sessionID.uuidString) state=\(next.rawValue) \(detail)")
     }
 
     private func isSessionActive(_ sessionID: UUID) -> Bool {
@@ -1958,11 +2041,4 @@ final class AppleLiveTranscriptionCoordinator {
         }
     }
 
-    private func trace(_ message: String) {
-#if DEBUG
-        print("[STT_TRACE][AppleLive] \(message)")
-#else
-        _ = message
-#endif
-    }
 }

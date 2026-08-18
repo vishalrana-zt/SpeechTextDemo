@@ -90,8 +90,8 @@ struct RecordScreen: View {
     @State private var bestLiveTranscriptForSession = ""
     @State private var showDeferredTransitionStatus = false
     @State private var deferredTransitionStatusTask: Task<Void, Never>?
-
-    private let liveDebugLoggingEnabled = false
+    @State private var recordingUITimerTask: Task<Void, Never>?
+    @State private var displayedRecordingSeconds: Int = 0
 
     init(
         autoStartOnAppear: Bool = false,
@@ -127,12 +127,10 @@ struct RecordScreen: View {
                 )
 
                 ZStack(alignment: .leading) {
-                    if isListening, let recordingStartedAt {
-                        TimelineView(.periodic(from: .now, by: 1.0)) { context in
-                            Text(formatDuration(seconds: Int(context.date.timeIntervalSince(recordingStartedAt))))
-                                .font(.title2.monospacedDigit().weight(.bold))
-                                .foregroundStyle(.red)
-                        }
+                    if isListening {
+                        Text(formatDuration(seconds: displayedRecordingSeconds))
+                            .font(.title2.monospacedDigit().weight(.bold))
+                            .foregroundStyle(.red)
                         .transition(.opacity)
                     } else if isTranscribing || ((isAutoStartingRecording || isStoppingRecording) && showDeferredTransitionStatus) {
                         HStack(spacing: 8) {
@@ -171,7 +169,13 @@ struct RecordScreen: View {
 
                 Spacer(minLength: 8)
 
-                Button(action: { Task { await toggleRecording() } }) {
+                Button(action: {
+                    if isListening {
+                        handleStopTapped()
+                    } else {
+                        Task { await toggleRecording() }
+                    }
+                }) {
                     HStack(spacing: 6) {
                         if isTranscribing || isAutoStartingRecording || isStoppingRecording {
                             ProgressView()
@@ -329,6 +333,7 @@ struct RecordScreen: View {
             micLevel = 0
             deferredTransitionStatusTask?.cancel()
             deferredTransitionStatusTask = nil
+            stopRecordingUITimer()
             showDeferredTransitionStatus = false
             uiPhase = .idle
         }
@@ -346,14 +351,10 @@ struct RecordScreen: View {
         if isAutoStartingRecording { return "Getting ready..." }
         if isStoppingRecording { return "Wrapping up..." }
         if isTranscribing { return "Finalizing text..." }
-        if isListening { return formattedRecordingDuration }
         return "Tap Speak now to start dictation"
     }
 
     private var idlePromptText: Text {
-        if isListening || isTranscribing {
-            return Text(statusText)
-        }
         return Text("Tap Speak now to start dictation")
     }
 
@@ -407,48 +408,24 @@ struct RecordScreen: View {
 
     @MainActor
     private func toggleRecording() async {
+        errorMessage = nil
+
+        if isListening {
+            handleStopTapped()
+            return
+        }
+
         guard !isRecordingTransitionInFlight else {
-            liveDebugLog("toggle_ignored_transition_in_flight")
             return
         }
         isRecordingTransitionInFlight = true
         defer { isRecordingTransitionInFlight = false }
-
-        errorMessage = nil
 
         guard await manager.gateFeatureUsage() else {
             errorMessage = "Model is not ready yet."
             if isAutoStartingRecording {
                 uiPhase = .idle
             }
-            return
-        }
-
-        if isListening {
-            let currentDuration = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
-            if currentDuration < minimumRecordingDuration {
-                liveDebugLog("stop_ignored_short_press duration=\(currentDuration)")
-                return
-            }
-            liveDebugLog("stop_requested duration_s=\(String(format: "%.2f", currentDuration))")
-            uiPhase = .finishing
-            finalizeRecordingSession()
-            guard lastRecordingDuration >= minimumRecordingDuration else {
-                errorMessage = "Recording is too short. Speak a bit longer, then tap Stop."
-                uiPhase = .idle
-                return
-            }
-            liveDebugLog("stop_mode live_enabled=\(isLiveTranscriptionEnabled) run_small=\(!isLiveTranscriptionEnabled)")
-            // Product mode behavior:
-            // - Live streaming ON: keep live transcript as final for this session.
-            // - Live streaming OFF: run post-recording Small finalization.
-            if isLiveTranscriptionEnabled {
-                await emitFinalFromLiveSessionIfAvailable()
-                onProcessingCompleted?()
-                uiPhase = .idle
-                return
-            }
-            await transcribeCurrentRecording()
             return
         }
 
@@ -460,7 +437,6 @@ struct RecordScreen: View {
             return
         }
 
-        let startupBeganAt = Date()
         transcript = ""
         bestLiveTranscriptForSession = ""
         lastRecordingDuration = 0
@@ -496,23 +472,76 @@ struct RecordScreen: View {
         }
 
         recordingStartedAt = Date()
+        displayedRecordingSeconds = 0
+        startRecordingUITimer()
         uiPhase = .recording
-        liveDebugLog("recording_started startup_latency_ms=\(Int(Date().timeIntervalSince(startupBeganAt) * 1000))")
         startLiveTranscriptionIfNeeded()
     }
 
     @MainActor
-    private func finalizeRecordingSession() {
-        stopLiveTranscription()
-        liveDebugLog("live_task_cancelled")
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.manager.stopListening()
+    private func handleStopTapped() {
+        let currentDuration = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        if currentDuration < minimumRecordingDuration {
+            return
         }
-        liveDebugLog("audio_stopped")
+        uiPhase = .finishing
+        finalizeRecordingSessionMetadata()
+        guard lastRecordingDuration >= minimumRecordingDuration else {
+            errorMessage = "Recording is too short. Speak a bit longer, then tap Stop."
+            uiPhase = .idle
+            return
+        }
+        let shouldUseLiveFinalization = isLiveTranscriptionEnabled
+        Task { @MainActor in
+            await stopManagerListeningAsync()
+            if shouldUseLiveFinalization {
+                await emitFinalFromLiveSessionIfAvailable()
+                onProcessingCompleted?()
+                uiPhase = .idle
+            } else {
+                await transcribeCurrentRecording()
+            }
+        }
+    }
+
+    @MainActor
+    private func finalizeRecordingSessionMetadata() {
+        stopLiveTranscription()
         if let recordingStartedAt {
             lastRecordingDuration = max(0, Date().timeIntervalSince(recordingStartedAt))
         }
         recordingStartedAt = nil
+        stopRecordingUITimer()
+    }
+
+    @MainActor
+    private func startRecordingUITimer() {
+        stopRecordingUITimer()
+        recordingUITimerTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard isListening else { return }
+                    displayedRecordingSeconds += 1
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func stopRecordingUITimer() {
+        recordingUITimerTask?.cancel()
+        recordingUITimerTask = nil
+    }
+
+    private func stopManagerListeningAsync() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.manager.stopListening()
+                continuation.resume()
+            }
+        }
     }
 
     @MainActor
@@ -525,9 +554,7 @@ struct RecordScreen: View {
             transcript = cleaned
             bestLiveTranscriptForSession = cleaned
             onTranscriptReady?(activeSessionID, cleaned)
-            sttTrace("emit_final_to_root session=\(activeSessionID.uuidString.prefix(8)) chars=\(cleaned.count) text=\"\(previewForLog(cleaned))\"")
         } catch {
-            liveDebugLog("live_final_emit_failed error=\"\(error.localizedDescription)\"")
         }
     }
 
@@ -535,14 +562,9 @@ struct RecordScreen: View {
     private func transcribeCurrentRecording() async {
         uiPhase = .transcribing
         defer { uiPhase = .idle }
-        let startedAt = Date()
-        liveDebugLog("final_start")
-
         do {
             let result = try await transcribeWithTimeout(seconds: 90)
             let cleaned = cleanedTranscript(result.text)
-            liveDebugLog("final_raw=\"\(result.text)\"")
-            liveDebugLog("final_cleaned=\"\(cleaned)\"")
             guard !cleaned.isEmpty else {
                 if maxMicLevelDuringSession < 0.04 {
                     errorMessage = "No speech detected. Try speaking louder or moving closer to the mic."
@@ -554,17 +576,13 @@ struct RecordScreen: View {
             transcript = cleaned
             bestLiveTranscriptForSession = cleaned
             onTranscriptReady?(activeSessionID, cleaned)
-            sttTrace("emit_final_to_root session=\(activeSessionID.uuidString.prefix(8)) chars=\(cleaned.count) text=\"\(previewForLog(cleaned))\"")
             onProcessingCompleted?()
-            liveDebugLog("final_complete latency_ms=\(Int(Date().timeIntervalSince(startedAt) * 1000))")
         } catch {
             let message = error.localizedDescription
             let fallbackSource = bestLiveTranscriptForSession.isEmpty ? transcript : bestLiveTranscriptForSession
             let fallback = cleanedTranscript(fallbackSource)
             if !fallback.isEmpty {
-                liveDebugLog("final_fallback_live_transcript")
                 onTranscriptReady?(activeSessionID, fallback)
-                sttTrace("emit_final_fallback_to_root session=\(activeSessionID.uuidString.prefix(8)) chars=\(fallback.count) text=\"\(previewForLog(fallback))\"")
                 onProcessingCompleted?()
             }
             if message.localizedCaseInsensitiveContains("no audio was captured") {
@@ -574,7 +592,6 @@ struct RecordScreen: View {
             } else {
                 errorMessage = message
             }
-            liveDebugLog("final_failed latency_ms=\(Int(Date().timeIntervalSince(startedAt) * 1000)) error=\"\(message)\"")
         }
     }
 
@@ -596,7 +613,7 @@ struct RecordScreen: View {
             userInfo: [NSLocalizedDescriptionKey: "Final transcription timed out."]
         )
 
-        let decodeTask = Task(priority: .userInitiated) {
+        let decodeTask = Task.detached(priority: .userInitiated) { [manager, preferredLanguage] in
             try await manager.transcribe(preferredLanguage: preferredLanguage)
         }
 
@@ -627,13 +644,13 @@ struct RecordScreen: View {
     private func handleManagerAutoStop() async {
         guard isListening else { return }
         uiPhase = .finishing
-        finalizeRecordingSession()
+        finalizeRecordingSessionMetadata()
         guard lastRecordingDuration >= minimumRecordingDuration else {
             errorMessage = "Recording is too short. Speak a bit longer, then tap Stop."
             uiPhase = .idle
             return
         }
-        liveDebugLog("autostop_mode live_enabled=\(isLiveTranscriptionEnabled) run_small=\(!isLiveTranscriptionEnabled)")
+        await stopManagerListeningAsync()
         if isLiveTranscriptionEnabled {
             await emitFinalFromLiveSessionIfAvailable()
             onProcessingCompleted?()
@@ -658,7 +675,6 @@ struct RecordScreen: View {
                 liveTickCounter = 0
                 hasFinishedFirstLiveDecodeAttempt = false
                 liveRecentDecodeLatencyMs = nil
-                liveDebugLog("start_live_task gen=\(generation) max=\(livePartialMaxAudioSeconds)s min=\(livePartialMinimumAudioSeconds)s poll=\(livePollingIntervalNanoseconds)")
             }
             while !Task.isCancelled {
                 let shouldContinue = await MainActor.run {
@@ -725,7 +741,6 @@ struct RecordScreen: View {
                                   isListening,
                                   isLiveTranscriptionEnabled,
                                   !isTranscribing else {
-                                liveDebugLog("tick_stale_drop gen=\(generation) active_gen=\(liveTaskGeneration)")
                                 return
                             }
                             liveTickCounter += 1
@@ -735,21 +750,15 @@ struct RecordScreen: View {
                             } else {
                                 self.liveRecentDecodeLatencyMs = decodeLatencyMs
                             }
-                            liveDebugLog("tick=\(liveTickCounter) decode_ms=\(Int(decodeLatencyMs))")
                             let cleaned = cleanedTranscript(partial.text)
-                            liveDebugLog("tick=\(liveTickCounter) raw=\"\(partial.text)\"")
-                            liveDebugLog("tick=\(liveTickCounter) cleaned=\"\(cleaned)\"")
                             guard !cleaned.isEmpty else {
-                                liveDebugLog("tick=\(liveTickCounter) skip_empty_cleaned")
                                 return
                             }
                             if !hasLoggedFirstLiveText, !isMeaningfulFirstLivePartial(cleaned) {
-                                liveDebugLog("tick=\(liveTickCounter) suppress_noisy_first_partial")
                                 return
                             }
-                            if !hasLoggedFirstLiveText, let recordingStartedAt {
+                            if !hasLoggedFirstLiveText {
                                 hasLoggedFirstLiveText = true
-                                liveDebugLog("first_visible_text_latency_ms=\(Int(Date().timeIntervalSince(recordingStartedAt) * 1000))")
                             }
                             transcript = cleaned
                             if cleaned.count > bestLiveTranscriptForSession.count {
@@ -777,7 +786,6 @@ struct RecordScreen: View {
                                 let now = Date()
                                 let minimumForwardInterval: TimeInterval = 0.35
                                 guard shouldForwardLivePartial(cleaned, at: now, minimumInterval: minimumForwardInterval) else {
-                                    liveDebugLog("tick=\(liveTickCounter) suppress_duplicate_or_throttled_partial")
                                     return
                                 }
                                 lastForwardedLiveText = cleaned
@@ -792,10 +800,6 @@ struct RecordScreen: View {
                                         volatileText: partial.volatileText
                                     )
                                 )
-                                sttTrace(
-                                    "emit_live_to_root session=\(activeSessionID.uuidString.prefix(8)) tick=\(liveTickCounter) window=[\(String(format: "%.2f", partial.windowStartTime)),\(String(format: "%.2f", partial.windowEndTime))] chars=\(cleaned.count) text=\"\(previewForLog(cleaned))\""
-                                )
-                                liveDebugLog("tick=\(liveTickCounter) forwarded_to_root")
                             }
                         }
                     }
@@ -810,7 +814,6 @@ struct RecordScreen: View {
                         let isCancellation = (error is CancellationError)
                             || error.localizedDescription.localizedCaseInsensitiveContains("cancellationerror")
                         if !isCancellation {
-                            liveDebugLog("decode_error=\"\(error.localizedDescription)\"")
                         }
                         if !hasFinishedFirstLiveDecodeAttempt {
                             hasFinishedFirstLiveDecodeAttempt = true
@@ -823,7 +826,6 @@ struct RecordScreen: View {
 
             await MainActor.run {
                 guard generation == liveTaskGeneration else { return }
-                liveDebugLog("end_live_task gen=\(generation)")
                 liveTranscriptionTask = nil
             }
         }
@@ -871,7 +873,6 @@ struct RecordScreen: View {
 
     private func cleanedTranscript(_ text: String) -> String {
         if invalidTranscriptMarkers.contains(where: { text.contains($0) }) {
-            liveDebugLog("filtered_invalid_transcript_dump")
             return ""
         }
         let nsText = text as NSString
@@ -938,27 +939,6 @@ struct RecordScreen: View {
         return normalizedCommonContractions.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    @MainActor
-    private func liveDebugLog(_ message: String) {
-        guard liveDebugLoggingEnabled else { return }
-        _ = message
-    }
-
-    private func sttTrace(_ message: String) {
-#if DEBUG
-        print("[STT_TRACE][RecordScreen] \(message)")
-#else
-        _ = message
-#endif
-    }
-
-    private func previewForLog(_ value: String) -> String {
-        let normalized = value.replacingOccurrences(of: "\n", with: " ")
-        if normalized.count > 120 {
-            return String(normalized.prefix(120)) + "..."
-        }
-        return normalized
-    }
 }
 
 private struct MicStatusOrb: View {
