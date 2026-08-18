@@ -6,6 +6,13 @@
 import SwiftUI
 
 struct RecordScreen: View {
+    private enum RecordingUIPhase: Equatable {
+        case idle
+        case starting
+        case recording
+        case finishing
+        case transcribing
+    }
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -29,7 +36,7 @@ struct RecordScreen: View {
         pattern: #"\[[^\]]*\]"#,
         options: [.caseInsensitive]
     )
-    private let whisperControlTokenRegex = try! NSRegularExpression(
+    private let controlTokenRegex = try! NSRegularExpression(
         pattern: #"<\|[^|>]+\|>"#,
         options: [.caseInsensitive]
     )
@@ -61,8 +68,7 @@ struct RecordScreen: View {
         "AnyTextStorage("
     ]
 
-    @State private var isListening = false
-    @State private var isTranscribing = false
+    @State private var uiPhase: RecordingUIPhase = .idle
     @State private var transcript = ""
     @State private var errorMessage: String?
     @State private var recordingStartedAt: Date?
@@ -79,8 +85,13 @@ struct RecordScreen: View {
     @State private var liveTaskGeneration: Int = 0
     @State private var hasFinishedFirstLiveDecodeAttempt = false
     @State private var liveRecentDecodeLatencyMs: Double?
+    @State private var lastForwardedLiveText = ""
+    @State private var lastForwardedLiveAt = Date.distantPast
+    @State private var bestLiveTranscriptForSession = ""
+    @State private var showDeferredTransitionStatus = false
+    @State private var deferredTransitionStatusTask: Task<Void, Never>?
 
-    private let liveDebugLoggingEnabled = true
+    private let liveDebugLoggingEnabled = false
 
     init(
         autoStartOnAppear: Bool = false,
@@ -115,35 +126,54 @@ struct RecordScreen: View {
                     level: micLevel
                 )
 
-                if isListening, let recordingStartedAt {
-                    TimelineView(.periodic(from: .now, by: 1.0)) { context in
-                        Text(formatDuration(seconds: Int(context.date.timeIntervalSince(recordingStartedAt))))
-                            .font(.title2.monospacedDigit().weight(.bold))
-                            .foregroundStyle(.red)
-                    }
-                } else if isTranscribing {
-                    HStack(spacing: 8) {
-                        Text("Transcribing...")
+                ZStack(alignment: .leading) {
+                    if isListening, let recordingStartedAt {
+                        TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                            Text(formatDuration(seconds: Int(context.date.timeIntervalSince(recordingStartedAt))))
+                                .font(.title2.monospacedDigit().weight(.bold))
+                                .foregroundStyle(.red)
+                        }
+                        .transition(.opacity)
+                    } else if isTranscribing || ((isAutoStartingRecording || isStoppingRecording) && showDeferredTransitionStatus) {
+                        HStack(spacing: 8) {
+                            Text(statusText)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .transaction { transaction in
+                                    transaction.animation = nil
+                                }
+                            if isTranscribing || isStoppingRecording {
+                                Text(formattedRecordingDuration)
+                                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .transition(.opacity)
+                    } else if isAutoStartingRecording || isStoppingRecording {
+                        Text(" ")
                             .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.primary)
-                        Text(formattedRecordingDuration)
-                            .font(.subheadline.monospacedDigit().weight(.semibold))
+                            .transition(.opacity)
+                    } else {
+                        idlePromptText
+                            .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.secondary)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.leading)
+                            .transaction { transaction in
+                                transaction.animation = nil
+                            }
+                            .transition(.opacity)
                     }
-                } else {
-                    idlePromptText
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .multilineTextAlignment(.leading)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(minHeight: 32, alignment: .leading)
 
                 Spacer(minLength: 8)
 
                 Button(action: { Task { await toggleRecording() } }) {
                     HStack(spacing: 6) {
-                        if isTranscribing {
+                        if isTranscribing || isAutoStartingRecording || isStoppingRecording {
                             ProgressView()
                                 .controlSize(.small)
                                 .tint(Color.accentColor)
@@ -156,11 +186,11 @@ struct RecordScreen: View {
                                 .font(.subheadline.weight(.semibold))
                         }
                     }
-                    .foregroundColor(isTranscribing ? .secondary : .white)
+                    .foregroundColor((isTranscribing || isAutoStartingRecording || isStoppingRecording) ? .secondary : .white)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 9)
                     .background(
-                        isTranscribing
+                        (isTranscribing || isAutoStartingRecording || isStoppingRecording)
                             ? Color.accentColor.opacity(0.18)
                             : (isListening ? Color.red : Color.accentColor),
                         in: Capsule()
@@ -168,12 +198,14 @@ struct RecordScreen: View {
                     .overlay(
                         Capsule()
                             .stroke(
-                                isTranscribing ? Color.accentColor.opacity(0.45) : Color.clear,
+                                (isTranscribing || isAutoStartingRecording || isStoppingRecording) ? Color.accentColor.opacity(0.45) : Color.clear,
                                 lineWidth: 1
                             )
                     )
                 }
-                .allowsHitTesting(!isTranscribing && !isRecordingTransitionInFlight)
+                .allowsHitTesting(!(isTranscribing || isAutoStartingRecording || isStoppingRecording) && !isRecordingTransitionInFlight)
+                .animation(phaseAnimation, value: uiPhase)
+                .animation(phaseAnimation, value: showDeferredTransitionStatus)
             }
             .padding(.horizontal, 2)
 
@@ -191,6 +223,7 @@ struct RecordScreen: View {
                     }
             }
 
+
             if isListening || isTranscribing {
                 VStack(alignment: .leading, spacing: 6) {
                     ListeningWaveformView(
@@ -200,6 +233,7 @@ struct RecordScreen: View {
                     )
                     .frame(maxWidth: .infinity)
                 }
+                .transition(.opacity)
             }
 
             if let errorMessage {
@@ -237,6 +271,7 @@ struct RecordScreen: View {
                 )
         )
         .shadow(color: panelShadowColor, radius: 14, y: 4)
+        .animation(phaseAnimation, value: uiPhase)
         .onAppear {
             manager.onAudioLevelChange = { rmsLevel in
                 Task { @MainActor in
@@ -252,6 +287,8 @@ struct RecordScreen: View {
             manager.onSilenceAutoStopTriggered = {
                 Task { await handleManagerAutoStop() }
             }
+            syncDeferredTransitionStatus(for: uiPhase)
+            manager.prewarmRecordingPathIfNeeded()
             if let initialLiveTranscriptionEnabled {
                 isLiveTranscriptionEnabled = initialLiveTranscriptionEnabled
                 manager.isLiveTranscriptionEnabled = initialLiveTranscriptionEnabled
@@ -259,35 +296,65 @@ struct RecordScreen: View {
                 isLiveTranscriptionEnabled = manager.isLiveTranscriptionEnabled
             }
 
-            // Prewarm first recording path to reduce initial Speak now latency.
-            manager.prewarmRecordingPathIfNeeded()
-            // Prewarm Tiny live decoder to reduce first visible partial latency.
-            manager.prewarmLiveDecodeIfNeeded()
-
-            guard autoStartOnAppear, !hasAutoStartedRecording else { return }
+            guard autoStartOnAppear, !hasAutoStartedRecording else {
+                return
+            }
             hasAutoStartedRecording = true
-            Task { await toggleRecording() }
+            uiPhase = .starting
+            Task {
+                guard !Task.isCancelled else { return }
+                // Let the sheet render one frame before expensive first-start work.
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard !isListening, !isTranscribing, !isRecordingTransitionInFlight else {
+                        uiPhase = .idle
+                        return
+                    }
+                }
+                await toggleRecording()
+            }
+        }
+        .onChange(of: uiPhase) { newPhase in
+            syncDeferredTransitionStatus(for: newPhase)
         }
         .onDisappear {
             stopLiveTranscription()
-            manager.stopListening()
+            DispatchQueue.global(qos: .utility).async {
+                self.manager.stopListening()
+            }
             manager.onAudioLevelChange = nil
             manager.onSilenceAutoStopTriggered = nil
+            manager.onBackendStatusChange = nil
             micLevel = 0
+            deferredTransitionStatusTask?.cancel()
+            deferredTransitionStatusTask = nil
+            showDeferredTransitionStatus = false
+            uiPhase = .idle
         }
     }
 
+    private var isListening: Bool { uiPhase == .recording }
+    private var isTranscribing: Bool { uiPhase == .transcribing }
+    private var isAutoStartingRecording: Bool { uiPhase == .starting }
+    private var isStoppingRecording: Bool { uiPhase == .finishing }
+    private var phaseAnimation: Animation {
+        .interactiveSpring(response: 0.28, dampingFraction: 0.88, blendDuration: 0.12)
+    }
+
     private var statusText: String {
-        if isTranscribing { return "Transcribing..." }
+        if isAutoStartingRecording { return "Getting ready..." }
+        if isStoppingRecording { return "Wrapping up..." }
+        if isTranscribing { return "Finalizing text..." }
         if isListening { return formattedRecordingDuration }
-        return "Tap Speak now to start recording"
+        return "Tap Speak now to start dictation"
     }
 
     private var idlePromptText: Text {
         if isListening || isTranscribing {
             return Text(statusText)
         }
-        return Text("Tap Speak now to start recording")
+        return Text("Tap Speak now to start dictation")
     }
 
     private var formattedRecordingDuration: String {
@@ -323,6 +390,22 @@ struct RecordScreen: View {
     }
 
     @MainActor
+    private func syncDeferredTransitionStatus(for phase: RecordingUIPhase) {
+        deferredTransitionStatusTask?.cancel()
+        deferredTransitionStatusTask = nil
+        showDeferredTransitionStatus = false
+        guard phase == .starting || phase == .finishing else { return }
+        deferredTransitionStatusTask = Task {
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard uiPhase == phase else { return }
+                showDeferredTransitionStatus = true
+            }
+        }
+    }
+
+    @MainActor
     private func toggleRecording() async {
         guard !isRecordingTransitionInFlight else {
             liveDebugLog("toggle_ignored_transition_in_flight")
@@ -335,6 +418,9 @@ struct RecordScreen: View {
 
         guard await manager.gateFeatureUsage() else {
             errorMessage = "Model is not ready yet."
+            if isAutoStartingRecording {
+                uiPhase = .idle
+            }
             return
         }
 
@@ -345,9 +431,11 @@ struct RecordScreen: View {
                 return
             }
             liveDebugLog("stop_requested duration_s=\(String(format: "%.2f", currentDuration))")
+            uiPhase = .finishing
             finalizeRecordingSession()
             guard lastRecordingDuration >= minimumRecordingDuration else {
-                errorMessage = "Recording too short. Speak for a moment, then tap Stop."
+                errorMessage = "Recording is too short. Speak a bit longer, then tap Stop."
+                uiPhase = .idle
                 return
             }
             liveDebugLog("stop_mode live_enabled=\(isLiveTranscriptionEnabled) run_small=\(!isLiveTranscriptionEnabled)")
@@ -355,68 +443,98 @@ struct RecordScreen: View {
             // - Live streaming ON: keep live transcript as final for this session.
             // - Live streaming OFF: run post-recording Small finalization.
             if isLiveTranscriptionEnabled {
+                await emitFinalFromLiveSessionIfAvailable()
                 onProcessingCompleted?()
+                uiPhase = .idle
                 return
             }
             await transcribeCurrentRecording()
             return
         }
 
+        uiPhase = .starting
         let granted = await manager.requestMicPermission()
         guard granted else {
-            errorMessage = "Microphone permission denied. Enable it in Settings."
+            errorMessage = "Microphone access is off. Enable it in Settings."
+            uiPhase = .idle
             return
         }
 
         let startupBeganAt = Date()
-        do {
-            manager.stopListening()
-            transcript = ""
-            lastRecordingDuration = 0
-            recordingStartedAt = Date()
-            hasLoggedFirstLiveText = false
-            hasFinishedFirstLiveDecodeAttempt = false
-            maxMicLevelDuringSession = 0
-            activeSessionID = UUID()
-            isListening = true
-            // Ensure no stale live loop is still running before a fresh start.
-            stopLiveTranscription()
-            // Only prewarm Small when running in post-recording mode.
-            if !isLiveTranscriptionEnabled {
-                manager.prewarmSmallFinalModelIfNeeded()
+        transcript = ""
+        bestLiveTranscriptForSession = ""
+        lastRecordingDuration = 0
+        hasLoggedFirstLiveText = false
+        hasFinishedFirstLiveDecodeAttempt = false
+        lastForwardedLiveText = ""
+        lastForwardedLiveAt = .distantPast
+        maxMicLevelDuringSession = 0
+        activeSessionID = UUID()
+        // Ensure no stale live loop is still running before a fresh start.
+        stopLiveTranscription()
+        let startError: Error? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    self.manager.stopListening()
+                    try self.manager.startListening(
+                        autoStopOnSilence: false,
+                        silenceDuration: 1.0,
+                        silenceThreshold: 0.003
+                    )
+                    continuation.resume(returning: nil)
+                } catch {
+                    continuation.resume(returning: error)
+                }
             }
-            try manager.startListening(
-                autoStopOnSilence: false,
-                silenceDuration: 1.0,
-                silenceThreshold: 0.003
-            )
-            liveDebugLog("recording_started startup_latency_ms=\(Int(Date().timeIntervalSince(startupBeganAt) * 1000))")
-            startLiveTranscriptionIfNeeded()
-        } catch {
-            isListening = false
-            recordingStartedAt = nil
-            errorMessage = error.localizedDescription
         }
+
+        if let startError {
+            uiPhase = .idle
+            recordingStartedAt = nil
+            errorMessage = startError.localizedDescription
+            return
+        }
+
+        recordingStartedAt = Date()
+        uiPhase = .recording
+        liveDebugLog("recording_started startup_latency_ms=\(Int(Date().timeIntervalSince(startupBeganAt) * 1000))")
+        startLiveTranscriptionIfNeeded()
     }
 
     @MainActor
     private func finalizeRecordingSession() {
         stopLiveTranscription()
         liveDebugLog("live_task_cancelled")
-        manager.stopListening()
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.manager.stopListening()
+        }
         liveDebugLog("audio_stopped")
         if let recordingStartedAt {
             lastRecordingDuration = max(0, Date().timeIntervalSince(recordingStartedAt))
         }
         recordingStartedAt = nil
-        isListening = false
+    }
+
+    @MainActor
+    private func emitFinalFromLiveSessionIfAvailable() async {
+        // Live mode should still emit one final commit event when recording stops.
+        do {
+            let result = try await manager.transcribe(preferredLanguage: preferredLanguage)
+            let cleaned = cleanedTranscript(result.text)
+            guard !cleaned.isEmpty else { return }
+            transcript = cleaned
+            bestLiveTranscriptForSession = cleaned
+            onTranscriptReady?(activeSessionID, cleaned)
+            sttTrace("emit_final_to_root session=\(activeSessionID.uuidString.prefix(8)) chars=\(cleaned.count) text=\"\(previewForLog(cleaned))\"")
+        } catch {
+            liveDebugLog("live_final_emit_failed error=\"\(error.localizedDescription)\"")
+        }
     }
 
     @MainActor
     private func transcribeCurrentRecording() async {
-        isListening = false
-        isTranscribing = true
-        defer { isTranscribing = false }
+        uiPhase = .transcribing
+        defer { uiPhase = .idle }
         let startedAt = Date()
         liveDebugLog("final_start")
 
@@ -427,28 +545,32 @@ struct RecordScreen: View {
             liveDebugLog("final_cleaned=\"\(cleaned)\"")
             guard !cleaned.isEmpty else {
                 if maxMicLevelDuringSession < 0.04 {
-                    errorMessage = "No speech detected. Try speaking louder or closer to the mic."
+                    errorMessage = "No speech detected. Try speaking louder or moving closer to the mic."
                 } else {
-                    errorMessage = "No usable speech detected for this session."
+                    errorMessage = "No clear speech was detected in this recording."
                 }
                 return
             }
             transcript = cleaned
+            bestLiveTranscriptForSession = cleaned
             onTranscriptReady?(activeSessionID, cleaned)
+            sttTrace("emit_final_to_root session=\(activeSessionID.uuidString.prefix(8)) chars=\(cleaned.count) text=\"\(previewForLog(cleaned))\"")
             onProcessingCompleted?()
             liveDebugLog("final_complete latency_ms=\(Int(Date().timeIntervalSince(startedAt) * 1000))")
         } catch {
             let message = error.localizedDescription
-            let fallback = cleanedTranscript(transcript)
+            let fallbackSource = bestLiveTranscriptForSession.isEmpty ? transcript : bestLiveTranscriptForSession
+            let fallback = cleanedTranscript(fallbackSource)
             if !fallback.isEmpty {
                 liveDebugLog("final_fallback_live_transcript")
                 onTranscriptReady?(activeSessionID, fallback)
+                sttTrace("emit_final_fallback_to_root session=\(activeSessionID.uuidString.prefix(8)) chars=\(fallback.count) text=\"\(previewForLog(fallback))\"")
                 onProcessingCompleted?()
             }
             if message.localizedCaseInsensitiveContains("no audio was captured") {
-                errorMessage = "No audio detected for this session."
+                errorMessage = "No audio was captured for this recording."
             } else if message.localizedCaseInsensitiveContains("timed out") {
-                errorMessage = "Final transcription timed out. Live transcript was kept."
+                errorMessage = "Final transcription took too long. Kept the live transcript."
             } else {
                 errorMessage = message
             }
@@ -504,14 +626,18 @@ struct RecordScreen: View {
     @MainActor
     private func handleManagerAutoStop() async {
         guard isListening else { return }
+        uiPhase = .finishing
         finalizeRecordingSession()
         guard lastRecordingDuration >= minimumRecordingDuration else {
-            errorMessage = "Recording too short. Speak for a moment, then tap Stop."
+            errorMessage = "Recording is too short. Speak a bit longer, then tap Stop."
+            uiPhase = .idle
             return
         }
         liveDebugLog("autostop_mode live_enabled=\(isLiveTranscriptionEnabled) run_small=\(!isLiveTranscriptionEnabled)")
         if isLiveTranscriptionEnabled {
+            await emitFinalFromLiveSessionIfAvailable()
             onProcessingCompleted?()
+            uiPhase = .idle
             return
         }
         await transcribeCurrentRecording()
@@ -544,6 +670,15 @@ struct RecordScreen: View {
                 guard shouldContinue else { break }
 
                 let effectivePollingInterval = await MainActor.run {
+                    let isSpeechRecognizerBackend = manager.isSpeechRecognizerLiveBackend
+                    if isSpeechRecognizerBackend {
+                        let bufferedSeconds = manager.currentBufferedAudioSeconds()
+                        if bufferedSeconds > 22.0 {
+                            return UInt64(1_100_000_000)
+                        }
+                        let speechRecognizerBase: UInt64 = 650_000_000
+                        return micLevel < 0.05 ? 850_000_000 : speechRecognizerBase
+                    }
                     if !hasLoggedFirstLiveText, isListening {
                         // Keep first-pass cadence responsive, but avoid busy-loop churn.
                         return UInt64(220_000_000)
@@ -617,6 +752,9 @@ struct RecordScreen: View {
                                 liveDebugLog("first_visible_text_latency_ms=\(Int(Date().timeIntervalSince(recordingStartedAt) * 1000))")
                             }
                             transcript = cleaned
+                            if cleaned.count > bestLiveTranscriptForSession.count {
+                                bestLiveTranscriptForSession = cleaned
+                            }
                             if isLiveTranscriptionEnabled, isListening {
                                 var cleanedSegments = partial.segments.compactMap { segment -> LiveTranscriptSegment? in
                                     let cleanedSegmentText = cleanedTranscript(segment.text)
@@ -636,13 +774,26 @@ struct RecordScreen: View {
                                         )
                                     ]
                                 }
+                                let now = Date()
+                                let minimumForwardInterval: TimeInterval = 0.35
+                                guard shouldForwardLivePartial(cleaned, at: now, minimumInterval: minimumForwardInterval) else {
+                                    liveDebugLog("tick=\(liveTickCounter) suppress_duplicate_or_throttled_partial")
+                                    return
+                                }
+                                lastForwardedLiveText = cleaned
+                                lastForwardedLiveAt = now
                                 onLiveTranscriptChanged?(
                                     LiveTranscriptPartial(
                                         sessionID: activeSessionID,
                                         windowStartTime: partial.windowStartTime,
                                         windowEndTime: partial.windowEndTime,
-                                        segments: cleanedSegments
+                                        segments: cleanedSegments,
+                                        committedText: partial.committedText,
+                                        volatileText: partial.volatileText
                                     )
+                                )
+                                sttTrace(
+                                    "emit_live_to_root session=\(activeSessionID.uuidString.prefix(8)) tick=\(liveTickCounter) window=[\(String(format: "%.2f", partial.windowStartTime)),\(String(format: "%.2f", partial.windowEndTime))] chars=\(cleaned.count) text=\"\(previewForLog(cleaned))\""
                                 )
                                 liveDebugLog("tick=\(liveTickCounter) forwarded_to_root")
                             }
@@ -685,6 +836,31 @@ struct RecordScreen: View {
         liveTranscriptionTask = nil
     }
 
+    private func shouldForwardLivePartial(
+        _ text: String,
+        at now: Date,
+        minimumInterval: TimeInterval
+    ) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        let previous = lastForwardedLiveText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == previous { return false }
+
+        if !previous.isEmpty {
+            let elapsed = now.timeIntervalSince(lastForwardedLiveAt)
+
+            if elapsed < minimumInterval {
+                let absoluteDelta = abs(trimmed.count - previous.count)
+                if absoluteDelta < 4 {
+                    return false
+                }
+            }
+        }
+
+        return true
+    }
+
     private func isMeaningfulFirstLivePartial(_ text: String) -> Bool {
         let words = text.split(whereSeparator: \.isWhitespace)
         if words.count >= 3 { return true }
@@ -702,15 +878,15 @@ struct RecordScreen: View {
         let fullRange = NSRange(location: 0, length: nsText.length)
         let withoutBlankAudio = blankAudioRegex.stringByReplacingMatches(in: text, options: [], range: fullRange, withTemplate: "")
         let rangeAfterBlank = NSRange(location: 0, length: (withoutBlankAudio as NSString).length)
-        let withoutWhisperControlTokens = whisperControlTokenRegex.stringByReplacingMatches(
+        let withoutControlTokens = controlTokenRegex.stringByReplacingMatches(
             in: withoutBlankAudio,
             options: [],
             range: rangeAfterBlank,
             withTemplate: ""
         )
-        let rangeAfterControlTokens = NSRange(location: 0, length: (withoutWhisperControlTokens as NSString).length)
+        let rangeAfterControlTokens = NSRange(location: 0, length: (withoutControlTokens as NSString).length)
         let withoutNonSpeechTags = nonSpeechAnnotationRegex.stringByReplacingMatches(
-            in: withoutWhisperControlTokens,
+            in: withoutControlTokens,
             options: [],
             range: rangeAfterControlTokens,
             withTemplate: ""
@@ -765,7 +941,23 @@ struct RecordScreen: View {
     @MainActor
     private func liveDebugLog(_ message: String) {
         guard liveDebugLoggingEnabled else { return }
-        print("[LIVE_DEBUG][RecordScreen] \(message)")
+        _ = message
+    }
+
+    private func sttTrace(_ message: String) {
+#if DEBUG
+        print("[STT_TRACE][RecordScreen] \(message)")
+#else
+        _ = message
+#endif
+    }
+
+    private func previewForLog(_ value: String) -> String {
+        let normalized = value.replacingOccurrences(of: "\n", with: " ")
+        if normalized.count > 120 {
+            return String(normalized.prefix(120)) + "..."
+        }
+        return normalized
     }
 }
 
@@ -832,6 +1024,8 @@ private struct MicStatusOrb: View {
             .frame(width: orbSize, height: orbSize)
         }
         .frame(width: isListening ? 46 : 52, height: isListening ? 46 : 52)
+        .animation(.easeOut(duration: 0.14), value: isListening)
+        .animation(.easeInOut(duration: 0.16), value: isTranscribing)
     }
 }
 

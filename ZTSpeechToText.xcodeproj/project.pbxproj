@@ -6,11 +6,6 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXBuildFile section */
-		18C9A6DA302B27FB00205C88 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 18C9A6D9302B27FB00205C88 /* WhisperKit */; };
-		18C9A741302B4C6A00205C88 /* ZIPFoundation in Frameworks */ = {isa = PBXBuildFile; productRef = 18C9A740302B4C6A00205C88 /* ZIPFoundation */; };
-/* End PBXBuildFile section */
-
 /* Begin PBXContainerItemProxy section */
 		18C9A6A3302B11B100205C88 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -71,8 +66,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				18C9A6DA302B27FB00205C88 /* WhisperKit in Frameworks */,
-				18C9A741302B4C6A00205C88 /* ZIPFoundation in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -133,8 +126,6 @@
 			);
 			name = ZTSpeechToText;
 			packageProductDependencies = (
-				18C9A6D9302B27FB00205C88 /* WhisperKit */,
-				18C9A740302B4C6A00205C88 /* ZIPFoundation */,
 			);
 			productName = ZTSpeechToText;
 			productReference = 18C9A695302B11B000205C88 /* ZTSpeechToText.app */;
@@ -219,8 +210,6 @@
 			mainGroup = 18C9A68C302B11B000205C88;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				18C9A6D8302B27FB00205C88 /* XCRemoteSwiftPackageReference "WhisperKit" */,
-				18C9A73F302B4C6A00205C88 /* XCRemoteSwiftPackageReference "ZIPFoundation" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 18C9A696302B11B000205C88 /* Products */;
@@ -611,38 +600,6 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
-/* Begin XCRemoteSwiftPackageReference section */
-		18C9A6D8302B27FB00205C88 /* XCRemoteSwiftPackageReference "WhisperKit" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/argmaxinc/WhisperKit";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 1.0.0;
-			};
-		};
-		18C9A73F302B4C6A00205C88 /* XCRemoteSwiftPackageReference "ZIPFoundation" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/weichsel/ZIPFoundation";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.9.20;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		18C9A6D9302B27FB00205C88 /* WhisperKit */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 18C9A6D8302B27FB00205C88 /* XCRemoteSwiftPackageReference "WhisperKit" */;
-			productName = WhisperKit;
-		};
-		18C9A740302B4C6A00205C88 /* ZIPFoundation */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 18C9A73F302B4C6A00205C88 /* XCRemoteSwiftPackageReference "ZIPFoundation" */;
-			productName = ZIPFoundation;
-		};
-/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 18C9A68D302B11B000205C88 /* Project object */;
 }

@@ -11,6 +11,24 @@ struct LiveTranscriptPartial: Sendable {
     let windowStartTime: TimeInterval
     let windowEndTime: TimeInterval
     let segments: [LiveTranscriptSegment]
+    let committedText: String?
+    let volatileText: String?
+
+    init(
+        sessionID: UUID,
+        windowStartTime: TimeInterval,
+        windowEndTime: TimeInterval,
+        segments: [LiveTranscriptSegment],
+        committedText: String? = nil,
+        volatileText: String? = nil
+    ) {
+        self.sessionID = sessionID
+        self.windowStartTime = windowStartTime
+        self.windowEndTime = windowEndTime
+        self.segments = segments
+        self.committedText = committedText
+        self.volatileText = volatileText
+    }
 }
 
 struct LiveTranscriptRenderState: Equatable {
@@ -34,7 +52,7 @@ struct LiveTranscriptReconciler {
     /// Segments older than current rolling-window start minus this tolerance are
     /// moved from provisional to committed text.
     private let mutableWindowSafetySeconds: TimeInterval = 1.00
-    private let whisperControlTokenRegex = try! NSRegularExpression(
+    private let controlTokenRegex = try! NSRegularExpression(
         pattern: #"<\|[^|>]+\|>"#,
         options: [.caseInsensitive]
     )
@@ -130,7 +148,7 @@ struct LiveTranscriptReconciler {
             rejectedIncomingStreak = 0
         }
 
-        // Whisper rolling windows often emit one long mutable segment; time-based
+        // Rolling windows often emit one long mutable segment; time-based
         // commit can stall in that case. Commit only the stable shared prefix and
         // keep a small mutable tail to preserve live correction behavior.
         if !shouldFreezeCommit,
@@ -292,7 +310,7 @@ struct LiveTranscriptReconciler {
 
     private func sanitize(_ text: String) -> String {
         let fullRange = NSRange(location: 0, length: (text as NSString).length)
-        let withoutTokens = whisperControlTokenRegex.stringByReplacingMatches(
+        let withoutTokens = controlTokenRegex.stringByReplacingMatches(
             in: text,
             options: [],
             range: fullRange,
@@ -517,24 +535,14 @@ struct LiveTranscriptReconciler {
         provisional: String,
         final: String? = nil
     ) {
-#if DEBUG
-        let sid = sessionID.uuidString.prefix(8)
-
-        func compact(_ value: String) -> String {
-            let clipped = value.count > 220 ? String(value.prefix(220)) + "…" : value
-            return clipped.replacingOccurrences(of: "\n", with: " ")
-        }
-
-        if let final {
-            print("[LIVE_RECON] sid=\(sid) update=\(update) final=\"\(compact(final))\"")
-        } else {
-            let windowStart = String(format: "%.2f", window.0)
-            let windowEnd = String(format: "%.2f", window.1)
-            let boundary = String(format: "%.2f", commitBoundary)
-            print(
-                "[LIVE_RECON] sid=\(sid) update=\(update) window=[\(windowStart),\(windowEnd)] boundary=\(boundary) incoming=\(incomingCount) commit=\(commitCount) committed_length=\(committed.count) provisional_length=\(provisional.count) committed=\"\(compact(committed))\" provisional=\"\(compact(provisional))\""
-            )
-        }
-#endif
+        _ = sessionID
+        _ = update
+        _ = commitBoundary
+        _ = window
+        _ = incomingCount
+        _ = commitCount
+        _ = committed
+        _ = provisional
+        _ = final
     }
 }

@@ -9,6 +9,8 @@ import UserNotifications
 struct SpeechToTextSheetConfiguration {
     var preferredLanguage: SpeechToTextManager.SupportedLanguage? = nil
     var operationMode: SpeechToTextManager.OperationMode = .liveStreaming
+    var modelProvider: SpeechToTextManager.ModelProvider? = nil
+    var showsModelProviderSelector: Bool = true
     var initialLiveTranscriptionEnabled: Bool? = nil
     var showsLiveTranscriptionToggle: Bool = false
     var livePartialMaxAudioSeconds: Double = 12.0
@@ -28,7 +30,8 @@ private struct SpeechToTextFlowSheet: View {
     @State private var showNotifyInfoAlert = false
     @State private var notifyInfoTitle = ""
     @State private var notifyInfoMessage = ""
-    @State private var shouldAutoStartRecording = false
+    @State private var shouldAutoStartRecording = true
+    @State private var selectedModelProvider: SpeechToTextManager.ModelProvider = .appleModels
 
     private let manager = SpeechToTextManager.shared
     let configuration: SpeechToTextSheetConfiguration
@@ -46,6 +49,8 @@ private struct SpeechToTextFlowSheet: View {
                 manager.onModelStateChange = { state in
                     DispatchQueue.main.async { modelState = state }
                 }
+                selectedModelProvider = .appleModels
+                manager.setModelProvider(selectedModelProvider)
                 applyModeSelection(
                     configuration.operationMode,
                     shouldKickoffSetup: true,
@@ -91,7 +96,7 @@ private struct SpeechToTextFlowSheet: View {
 
     @ViewBuilder
     private var panelView: some View {
-        if case .ready = modelState {
+        VStack(alignment: .leading, spacing: 10) {
             RecordScreen(
                 autoStartOnAppear: shouldAutoStartRecording,
                 preferredLanguage: configuration.preferredLanguage,
@@ -109,25 +114,6 @@ private struct SpeechToTextFlowSheet: View {
                 onProcessingCompleted: {
                     onCloseRequested()
                 }
-            )
-        } else if manager.isBundledModelSource, isPreparingBundledModel {
-            bundledPreparingView
-        } else {
-            DownloadScreen(
-                modelState: modelState,
-                modeTitle: modeTitle,
-                onPrimaryActionTapped: {
-                    startDownloadIfNeeded(force: true)
-                },
-                onNotifyTapped: {
-                    requestNotifyPermissionAndShowMessage()
-                    hasCollapsedToCompactDownloadingBar = true
-                    UserDefaults.standard.set(true, forKey: compactDownloadBarPreferenceKey)
-                },
-                onCompactDismissTapped: {
-                    onCloseRequested()
-                },
-                showCompactDownloadingBar: hasCollapsedToCompactDownloadingBar
             )
         }
     }
@@ -165,7 +151,7 @@ private struct SpeechToTextFlowSheet: View {
     }
 
     private var bundledLoadingText: String {
-        return "Loading model"
+        return "Preparing model"
     }
 
     private var compactDownloadBarPreferenceKey: String {
@@ -175,27 +161,22 @@ private struct SpeechToTextFlowSheet: View {
     private var modeTitle: String {
         switch configuration.operationMode {
         case .liveStreaming:
-            return "Live streaming"
+            return "Live dictation"
         case .postRecording:
-            return "Post recording"
+            return "After recording"
         }
     }
 
     private func startDownloadIfNeeded(force: Bool = false) {
-        if manager.isBundledModelSource {
-            isPreparingBundledModel = true
-            Task {
-                await manager.prepareOnOptIn()
-                await MainActor.run {
-                    isPreparingBundledModel = false
-                }
-            }
-            return
-        }
-
         guard force || !didStartDownloadInThisSession else { return }
         didStartDownloadInThisSession = true
-        Task { await manager.prepareOnOptIn() }
+        isPreparingBundledModel = true
+        Task {
+            await manager.prepareOnOptIn()
+            await MainActor.run {
+                isPreparingBundledModel = false
+            }
+        }
     }
 
     private func applyModeSelection(
@@ -205,34 +186,15 @@ private struct SpeechToTextFlowSheet: View {
     ) {
         manager.setOperationMode(mode)
         hasCollapsedToCompactDownloadingBar = UserDefaults.standard.bool(forKey: compactDownloadBarPreferenceKey)
-        modelState = manager.modelState(for: mode)
-        shouldAutoStartRecording = allowAutoStartWhenReady && {
-            if case .ready = modelState { return true }
-            return false
-        }()
-
-        if case .downloading = modelState {
-            didStartDownloadInThisSession = true
-        } else if case .loadingModel = modelState {
-            didStartDownloadInThisSession = true
-        } else {
-            didStartDownloadInThisSession = false
+        // Apple-only provider path.
+        modelState = .ready
+        didStartDownloadInThisSession = false
+        isPreparingBundledModel = false
+        if allowAutoStartWhenReady {
+            shouldAutoStartRecording = true
         }
-
         guard shouldKickoffSetup else { return }
-        if manager.isBundledModelSource {
-            isPreparingBundledModel = true
-            Task {
-                await manager.prepareOnOptIn()
-                await MainActor.run {
-                    isPreparingBundledModel = false
-                }
-            }
-        } else if manager.hasOptedIn {
-            Task { await manager.restoreIfAlreadyDownloaded() }
-        } else {
-            startDownloadIfNeeded()
-        }
+        return
     }
 
     private func requestNotifyPermissionAndShowMessage() {
@@ -314,7 +276,7 @@ private struct SpeechToTextSheetModifier: ViewModifier {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
-            .animation(.easeInOut(duration: 0.25), value: isPresented)
+            .animation(.interactiveSpring(response: 0.30, dampingFraction: 0.90, blendDuration: 0.10), value: isPresented)
     }
 }
 

@@ -48,18 +48,11 @@ final class SpeechAnalyzerTranscriptionEngine {
         preset: SpeechTranscriber.Preset
     ) async throws -> SpeechAnalyzerTranscriptionOutput {
         guard !audio.isEmpty else { throw EngineError.emptyAudio }
-        let audioSeconds = Double(audio.count) / sampleRate
-#if DEBUG
-        print(
-            "[LIVE_DEBUG][SpeechAnalyzer] transcribe_start preset=\(String(describing: preset)) localeHint=\(localeHint?.identifier ?? "auto") audio_s=\(String(format: "%.2f", audioSeconds))"
-        )
-#endif
+        trace("start audio_s=\(String(format: "%.2f", Double(audio.count) / sampleRate)) locale_hint=\(localeHint?.identifier ?? "auto") preset=\(String(describing: preset))")
         try await ensureSpeechAuthorization()
 
         let locale = try await resolveLocale(localeHint: localeHint)
-#if DEBUG
-        print("[LIVE_DEBUG][SpeechAnalyzer] locale_resolved locale=\(locale.identifier)")
-#endif
+        trace("locale_resolved=\(locale.identifier)")
         let transcriber = SpeechTranscriber(locale: locale, preset: preset)
         try await ensureAssetsReady(for: transcriber, locale: locale)
 
@@ -70,13 +63,17 @@ final class SpeechAnalyzerTranscriptionEngine {
         let file = try AVAudioFile(forReading: fileURL)
         let resultsTask = Task<String, Error> {
             var latestText = ""
+            var strongestText = ""
             for try await result in transcriber.results {
                 let candidate = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !candidate.isEmpty {
                     latestText = candidate
+                    if candidate.count > strongestText.count {
+                        strongestText = candidate
+                    }
                 }
             }
-            return latestText
+            return strongestText.isEmpty ? latestText : strongestText
         }
 
         let lastSampleTime = try await analyzer.analyzeSequence(from: file)
@@ -87,9 +84,7 @@ final class SpeechAnalyzerTranscriptionEngine {
         }
 
         let text = try await resultsTask.value
-#if DEBUG
-        print("[LIVE_DEBUG][SpeechAnalyzer] transcribe_done locale=\(locale.identifier) text_chars=\(text.count)")
-#endif
+        trace("final_result chars=\(text.count) text=\"\(preview(text))\"")
         return SpeechAnalyzerTranscriptionOutput(text: text, locale: locale)
     }
 
@@ -124,21 +119,30 @@ final class SpeechAnalyzerTranscriptionEngine {
     }
 
     private func resolveLocale(localeHint: Locale?) async throws -> Locale {
-        if let localeHint,
-           let supported = await SpeechTranscriber.supportedLocale(equivalentTo: localeHint) {
-            return supported
-        }
-
-        if let current = await SpeechTranscriber.supportedLocale(equivalentTo: Locale.current) {
-            return current
+        // Avoid supportedLocale(equivalentTo:) due runtime traps seen on some
+        // iOS 26 builds. Choose locale from hint/current and then supported list.
+        if let localeHint {
+            return localeHint
         }
 
         let supportedLocales = await SpeechTranscriber.supportedLocales
-        if let first = supportedLocales.first {
-            return first
+        if supportedLocales.isEmpty {
+            throw EngineError.unsupportedLocale
         }
 
-        throw EngineError.unsupportedLocale
+        let current = Locale.current
+        if let exact = supportedLocales.first(where: { $0.identifier == current.identifier }) {
+            return exact
+        }
+
+        if let currentLanguage = current.language.languageCode?.identifier,
+           let byLanguage = supportedLocales.first(where: {
+               $0.language.languageCode?.identifier == currentLanguage
+           }) {
+            return byLanguage
+        }
+
+        return supportedLocales[0]
     }
 
     private func ensureAssetsReady(for transcriber: SpeechTranscriber, locale: Locale) async throws {
@@ -148,13 +152,7 @@ final class SpeechAnalyzerTranscriptionEngine {
         try await reserveLocaleForAssets(locale)
 
         if let installationRequest = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-#if DEBUG
-            print("[LIVE_DEBUG][SpeechAnalyzer] asset_installation_start locale=\(locale.identifier)")
-#endif
             try await installationRequest.downloadAndInstall()
-#if DEBUG
-            print("[LIVE_DEBUG][SpeechAnalyzer] asset_installation_done locale=\(locale.identifier)")
-#endif
         }
 
         await Self.assetPreparationState.markPrepared(locale: locale)
@@ -172,19 +170,10 @@ final class SpeechAnalyzerTranscriptionEngine {
         var lastError: Error?
         for candidate in candidates {
             do {
-#if DEBUG
-                print("[LIVE_DEBUG][SpeechAnalyzer] reserve_locale_start locale=\(candidate.identifier)")
-#endif
                 _ = try await AssetInventory.reserve(locale: candidate)
-#if DEBUG
-                print("[LIVE_DEBUG][SpeechAnalyzer] reserve_locale_done locale=\(candidate.identifier)")
-#endif
                 return
             } catch {
                 lastError = error
-#if DEBUG
-                print("[LIVE_DEBUG][SpeechAnalyzer] reserve_locale_failed locale=\(candidate.identifier) error=\"\(error.localizedDescription)\"")
-#endif
             }
         }
 
@@ -214,5 +203,21 @@ final class SpeechAnalyzerTranscriptionEngine {
         let file = try AVAudioFile(forWriting: url, settings: format.settings)
         try file.write(from: buffer)
         return url
+    }
+
+    private func trace(_ message: String) {
+#if DEBUG
+        print("[STT_TRACE][SpeechAnalyzer] \(message)")
+#else
+        _ = message
+#endif
+    }
+
+    private func preview(_ text: String) -> String {
+        let normalized = text.replacingOccurrences(of: "\n", with: " ")
+        if normalized.count > 120 {
+            return String(normalized.prefix(120)) + "..."
+        }
+        return normalized
     }
 }

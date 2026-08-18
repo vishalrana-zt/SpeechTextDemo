@@ -2,22 +2,30 @@
 //  SpeechToTextManager.swift
 //  Offline, on-device speech-to-text with automatic language detection.
 //
-//  Requires: WhisperKit (https://github.com/argmaxinc/WhisperKit) added via SPM.
-//  Package URL: https://github.com/argmaxinc/WhisperKit
-//
-
 import Foundation
 import AVFoundation
 import CoreML
 import Speech
-import WhisperKit
 
 final class SpeechToTextManager: NSObject {
 
     // MARK: - Singleton
 
     static let shared = SpeechToTextManager()
-    private override init() { super.init() }
+    private override init() {
+        super.init()
+        bootstrapAppleAdvancedPathSafetyState()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioSessionInterruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     // MARK: - Types
 
@@ -57,8 +65,30 @@ final class SpeechToTextManager: NSObject {
     }
     
     enum TranscriptionEngine: String {
-        case whisperKit
         case speechAnalyzer
+        case dictationTranscriber
+        case speechRecognizer
+    }
+
+    enum ModelProvider: String, CaseIterable {
+        case appleModels
+
+        var displayName: String {
+            "Apple Models"
+        }
+    }
+
+    var backendStatusLabel: String {
+        if #available(iOS 26.0, *) {
+            return useAdvancedAppleLiveTranscribers
+                ? "Apple SpeechAnalyzer"
+                : "Apple SpeechRecognizer"
+        }
+        return "Apple SpeechRecognizer"
+    }
+
+    var isSpeechRecognizerLiveBackend: Bool {
+        preferredLivePartialEngine() == .speechRecognizer
     }
 
     struct DownloadStatus: Equatable {
@@ -73,6 +103,26 @@ final class SpeechToTextManager: NSObject {
         let windowStartTime: TimeInterval
         let windowEndTime: TimeInterval
         let segments: [LiveTranscriptSegment]
+        let committedText: String?
+        let volatileText: String?
+
+        init(
+            text: String,
+            language: SupportedLanguage,
+            windowStartTime: TimeInterval,
+            windowEndTime: TimeInterval,
+            segments: [LiveTranscriptSegment],
+            committedText: String? = nil,
+            volatileText: String? = nil
+        ) {
+            self.text = text
+            self.language = language
+            self.windowStartTime = windowStartTime
+            self.windowEndTime = windowEndTime
+            self.segments = segments
+            self.committedText = committedText
+            self.volatileText = volatileText
+        }
     }
 
     enum ModelState: Equatable {
@@ -92,11 +142,10 @@ final class SpeechToTextManager: NSObject {
 
     /// Hook this up to a progress bar / label in your opt-in UI.
     var onModelStateChange: ((ModelState) -> Void)?
+    var onBackendStatusChange: ((String) -> Void)?
 
     // MARK: - Private
 
-    private var liveWhisperKit: WhisperKit?
-    private var finalWhisperKit: WhisperKit?
     private let audioEngine = AVAudioEngine()
     private var sampleBuffer: [Float] = []
     private let targetSampleRate: Double = 16_000
@@ -110,8 +159,6 @@ final class SpeechToTextManager: NSObject {
     private var accumulatedRecordingDuration: TimeInterval = 0
     private var hasTriggeredAutoStop = false
     private let maxRecordingDuration: TimeInterval = 10 * 60
-    private let prepareTaskLock = NSLock()
-    private var inFlightPrepareTasks: [ModelVariant: Task<Void, Never>] = [:]
     private var liveLockedLanguage: SupportedLanguage?
     private var pendingLiveLockLanguage: SupportedLanguage?
     private var pendingLiveLockConfirmations: Int = 0
@@ -119,11 +166,15 @@ final class SpeechToTextManager: NSObject {
     private let liveLanguageLockMinimumSeconds: Double = 2.0
     private let liveLanguageLockConfirmationsRequired: Int = 2
     private var didPrewarmRecordingPath = false
-    private var didPrewarmLiveDecode = false
-    private var isPrewarmingSmallModel = false
     private var hasLoggedRuntimeConfig = false
     private var hasDisabledSpeechAnalyzerForSession = false
     private var hasValidatedSpeechAnalyzerForSession = false
+    private let appleCapabilityLock = NSLock()
+    private var advancedAppleTranscriberCapable = false
+    private var didCheckAdvancedAppleTranscriberCapability = false
+    private let speechAnalyzerValidationTaskLock = NSLock()
+    private var speechAnalyzerValidationTaskID: UUID?
+    private var speechAnalyzerValidationTask: Task<Bool, Never>?
     private actor LiveDecodeCoordinator {
         private var isInFlight = false
         private var lastStart: Date?
@@ -155,27 +206,197 @@ final class SpeechToTextManager: NSObject {
         }
     }
     private let liveDecodeCoordinator = LiveDecodeCoordinator()
+    private let appleLiveStateLock = NSLock()
+    private var appleLiveCoordinatorBox: AnyObject?
+    private var appleLiveFinalText: String?
+    private var lastNonEmptyLiveTranscriptText: String?
+    private var isAppleLiveSessionStarting = false
+    // SpeechRecognizer fallback needs a stable committed/volatile split to avoid
+    // rolling-window rewrites and repeated text on long live sessions.
+    private var speechRecognizerCommittedWords: [String] = []
+    private var speechRecognizerLastHypothesisWords: [String] = []
+    private var speechRecognizerLastVolatileWords: [String] = []
+    private var speechRecognizerLastWindowStartTime: TimeInterval = 0
+    private let speechRecognizerMutableTailWordCount = 8
+
+    private func setAppleLiveFinalText(_ text: String?) {
+        appleLiveStateLock.lock()
+        appleLiveFinalText = text
+        appleLiveStateLock.unlock()
+    }
+
+    private func getAppleLiveFinalText() -> String? {
+        appleLiveStateLock.lock()
+        let value = appleLiveFinalText
+        appleLiveStateLock.unlock()
+        return value
+    }
+
+    private func rememberLiveTranscriptTextIfNonEmpty(_ text: String) {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        appleLiveStateLock.lock()
+        lastNonEmptyLiveTranscriptText = normalized
+        appleLiveStateLock.unlock()
+    }
+
+    private func getLastNonEmptyLiveTranscriptText() -> String? {
+        appleLiveStateLock.lock()
+        let value = lastNonEmptyLiveTranscriptText
+        appleLiveStateLock.unlock()
+        return value
+    }
+
+    @available(iOS 26.0, *)
+    private func takeAppleLiveCoordinator() -> AppleLiveTranscriptionCoordinator? {
+        appleLiveStateLock.lock()
+        let coordinator = appleLiveCoordinatorBox as? AppleLiveTranscriptionCoordinator
+        appleLiveCoordinatorBox = nil
+        appleLiveStateLock.unlock()
+        return coordinator
+    }
+
+    private func beginAppleLiveSessionStartIfNeeded() -> Bool {
+        appleLiveStateLock.lock()
+        defer { appleLiveStateLock.unlock() }
+        if appleLiveCoordinatorBox != nil || isAppleLiveSessionStarting {
+            return false
+        }
+        isAppleLiveSessionStarting = true
+        return true
+    }
+
+    private func endAppleLiveSessionStartIfNeeded() {
+        appleLiveStateLock.lock()
+        isAppleLiveSessionStarting = false
+        appleLiveStateLock.unlock()
+    }
+
+    private var useAdvancedAppleLiveTranscribers: Bool {
+        guard #available(iOS 26.0, *) else { return false }
+        guard selectedModelProvider == .appleModels else { return false }
+        guard operationMode == .liveStreaming else { return false }
+        guard isAdvancedApplePathExplicitlyEnabled else { return false }
+        guard !hasDisabledSpeechAnalyzerForSession else { return false }
+        guard !isAppleAdvancedPathQuarantined() else { return false }
+        appleCapabilityLock.lock()
+        let enabled = advancedAppleTranscriberCapable
+        appleCapabilityLock.unlock()
+        return enabled
+    }
+
+    private func setAdvancedAppleTranscriberCapability(_ enabled: Bool, checked: Bool) {
+        appleCapabilityLock.lock()
+        advancedAppleTranscriberCapable = enabled
+        didCheckAdvancedAppleTranscriberCapability = checked
+        appleCapabilityLock.unlock()
+    }
+
+    private func shouldSkipAdvancedAppleCapabilityRefresh() -> Bool {
+        appleCapabilityLock.lock()
+        let shouldSkip = didCheckAdvancedAppleTranscriberCapability
+        appleCapabilityLock.unlock()
+        return shouldSkip
+    }
+
+    private func bootstrapAppleAdvancedPathSafetyState() {
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: Self.appleAdvancedArmedKey) {
+            defaults.set(true, forKey: Self.appleAdvancedQuarantinedKey)
+            defaults.set(false, forKey: Self.appleAdvancedArmedKey)
+            sttTrace("apple_advanced_path_quarantined reason=previous_unclean_exit")
+        }
+#if DEBUG
+        // Enable advanced Apple path testing by default on debug builds only.
+        if defaults.object(forKey: Self.appleAdvancedExplicitOptInKey) == nil {
+            defaults.set(true, forKey: Self.appleAdvancedExplicitOptInKey)
+            sttTrace("apple_advanced_path_opt_in defaulted=true scope=debug")
+        }
+
+        // Developer convenience: automatically clear quarantine on launch in debug
+        // so each run can attempt advanced Apple path without manual reset calls.
+        if defaults.bool(forKey: Self.appleAdvancedQuarantinedKey) {
+            defaults.set(false, forKey: Self.appleAdvancedQuarantinedKey)
+            defaults.set(false, forKey: Self.appleAdvancedArmedKey)
+            sttTrace("apple_advanced_path_quarantine_cleared reason=debug_auto_clear_on_launch")
+        }
+#endif
+    }
+
+    private func isAppleAdvancedPathQuarantined() -> Bool {
+        UserDefaults.standard.bool(forKey: Self.appleAdvancedQuarantinedKey)
+    }
+
+    // Safe default: advanced Apple live transcriber path must be explicit opt-in.
+    private var isAdvancedApplePathExplicitlyEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.appleAdvancedExplicitOptInKey)
+    }
+
+    private func armAppleAdvancedPath() {
+        UserDefaults.standard.set(true, forKey: Self.appleAdvancedArmedKey)
+    }
+
+    private func disarmAppleAdvancedPath() {
+        UserDefaults.standard.set(false, forKey: Self.appleAdvancedArmedKey)
+    }
+
+    /// Controlled recovery hook: keeps quarantine mechanism, but allows an explicit retry.
+    func clearAppleAdvancedPathQuarantineForRetry() {
+        let defaults = UserDefaults.standard
+        defaults.set(false, forKey: Self.appleAdvancedQuarantinedKey)
+        defaults.set(false, forKey: Self.appleAdvancedArmedKey)
+        hasDisabledSpeechAnalyzerForSession = false
+        hasValidatedSpeechAnalyzerForSession = false
+        setAdvancedAppleTranscriberCapability(false, checked: false)
+        sttTrace("apple_advanced_path_quarantine_cleared reason=manual_retry")
+        Task(priority: .utility) { [weak self] in
+            await self?.refreshAdvancedAppleTranscriberCapabilityIfNeeded(force: true)
+        }
+    }
+
+    private func refreshAdvancedAppleTranscriberCapabilityIfNeeded(force: Bool) async {
+        guard selectedModelProvider == .appleModels else {
+            setAdvancedAppleTranscriberCapability(false, checked: false)
+            disarmAppleAdvancedPath()
+            return
+        }
+        guard !isAppleAdvancedPathQuarantined() else {
+            setAdvancedAppleTranscriberCapability(false, checked: true)
+            sttTrace("apple_transcriber_capability enabled=false reason=quarantined_after_unclean_exit")
+            publishBackendStatus()
+            return
+        }
+        guard #available(iOS 26.0, *) else {
+            setAdvancedAppleTranscriberCapability(false, checked: true)
+            return
+        }
+        if !force, shouldSkipAdvancedAppleCapabilityRefresh() { return }
+
+        let isAvailable = SpeechTranscriber.isAvailable
+        let locales = await SpeechTranscriber.supportedLocales
+        let runtimeCapable = isAvailable && !locales.isEmpty
+        let enabled = runtimeCapable && isAdvancedApplePathExplicitlyEnabled
+        setAdvancedAppleTranscriberCapability(enabled, checked: true)
+        sttTrace("apple_transcriber_capability is_available=\(isAvailable) locales=\(locales.count) explicit_opt_in=\(isAdvancedApplePathExplicitlyEnabled) enabled=\(enabled)")
+        publishBackendStatus()
+    }
 
     var onSilenceAutoStopTriggered: (() -> Void)?
     var onAudioLevelChange: ((Float) -> Void)?
     
-    /// Safe feature flag:
-    /// - false (default): WhisperKit-only behavior (existing path)
-    /// - true: prefers SpeechAnalyzer when runtime supports it, with automatic fallback to WhisperKit
-    var useSpeechAnalyzerWhenAvailable: Bool = false
+    /// Compatibility bridge used by existing logic; now driven by model provider selection.
+    var useSpeechAnalyzerWhenAvailable: Bool {
+        get { selectedModelProvider == .appleModels }
+        set { setModelProvider(.appleModels) }
+    }
 
     private static let modelReadyKey = "SpeechToTextManager.modelReadyV2"
     private static let optedInKey = "SpeechToTextManager.optedIn"
     private static let liveTranscriptionEnabledKey = "SpeechToTextManager.liveTranscriptionEnabled"
-    private static let tinyModelName = "openai_whisper-tiny"
-    private static let smallModelName = "openai_whisper-small"
-    private static let modelRepo = "argmaxinc/whisperkit-coreml"
-    private static let tinyModelZipURL = requiredURL(
-        "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-tiny.zip"
-    )
-    private static let smallModelZipURL = requiredURL(
-        "https://zt-cdn.zentrades.pro/iOS-Assets/openai_whisper-small.zip"
-    )
+    private static let modelProviderKey = "SpeechToTextManager.modelProvider"
+    private static let appleAdvancedArmedKey = "SpeechToTextManager.appleAdvancedArmed"
+    private static let appleAdvancedQuarantinedKey = "SpeechToTextManager.appleAdvancedQuarantined"
+    private static let appleAdvancedExplicitOptInKey = "SpeechToTextManager.appleAdvancedExplicitOptIn"
     
     /// True once the model is downloaded AND loaded into memory — the only
     /// state in which recording/transcription is actually usable.
@@ -202,76 +423,43 @@ final class SpeechToTextManager: NSObject {
             UserDefaults.standard.set(newValue, forKey: Self.liveTranscriptionEnabledKey)
         }
     }
-    
-    enum ModelSource {
-        case bundled       // shipped inside the app, zero download
-        case cdn           // your S3+CloudFront
-        case huggingface   // HuggingFace hub
-    }
 
-    private enum ModelVariant: CaseIterable {
-        case tiny
-        case small
-
-        var installFolderName: String {
-            switch self {
-            case .tiny: return "SpeechModelTiny"
-            case .small: return "SpeechModelSmall"
-            }
-        }
-
-        var modelName: String {
-            switch self {
-            case .tiny: return SpeechToTextManager.tinyModelName
-            case .small: return SpeechToTextManager.smallModelName
-            }
-        }
-
-        var cdnZipURL: URL {
-            switch self {
-            case .tiny: return SpeechToTextManager.tinyModelZipURL
-            case .small: return SpeechToTextManager.smallModelZipURL
-            }
-        }
-    }
-
-    private enum ComputeProfile {
-        case liveTinyFast
-        case finalSmallBalanced
-    }
-
-    private static let modelSource: ModelSource = .cdn
-    private let tinyCDNDownloader = CDNModelDownloader()
-    private let smallCDNDownloader = CDNModelDownloader()
     private var operationMode: OperationMode = .liveStreaming
-    private var modelStateByVariant: [ModelVariant: ModelState] = [
-        .tiny: .notDownloaded,
-        .small: .notDownloaded
-    ]
 
-    var isBundledModelSource: Bool {
-        Self.modelSource == .bundled
-    }
-
-    private static func requiredURL(_ value: String) -> URL {
-        guard let url = URL(string: value) else {
-            preconditionFailure("Invalid URL: \(value)")
-        }
-        return url
-    }
-
-    func modelState(for mode: OperationMode) -> ModelState {
-        let variant = modelVariant(for: mode)
-        if canUseSpeechAnalyzer {
-            // Strict contract: SpeechAnalyzer-enabled sessions are considered ready
-            // only if the same-mode Whisper fallback model is also ready.
-            let fallbackState = modelStateWithoutSpeechAnalyzerOverride(for: variant)
-            if case .ready = fallbackState {
-                return .ready
+    var selectedModelProvider: ModelProvider {
+        get {
+            if let raw = UserDefaults.standard.string(forKey: Self.modelProviderKey),
+               let provider = ModelProvider(rawValue: raw) {
+                return provider
             }
-            return fallbackState
+            return .appleModels
         }
-        return modelStateWithoutSpeechAnalyzerOverride(for: variant)
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: Self.modelProviderKey)
+        }
+    }
+
+    func setModelProvider(_ provider: ModelProvider) {
+        let provider: ModelProvider = .appleModels
+        let previous = selectedModelProvider
+        guard previous != provider else { return }
+        cancelSpeechAnalyzerValidationTaskIfNeeded()
+        selectedModelProvider = provider
+        hasDisabledSpeechAnalyzerForSession = false
+        hasValidatedSpeechAnalyzerForSession = false
+        setAdvancedAppleTranscriberCapability(false, checked: false)
+        hasLoggedRuntimeConfig = false
+        setAppleLiveFinalText(nil)
+        modelState = modelState(for: operationMode)
+        publishBackendStatus()
+
+        Task(priority: .utility) { [weak self] in
+            await self?.refreshAdvancedAppleTranscriberCapabilityIfNeeded(force: true)
+        }
+    }
+
+    func modelState(for _: OperationMode) -> ModelState {
+        return .ready
     }
 
     func setOperationMode(_ mode: OperationMode) {
@@ -284,87 +472,9 @@ final class SpeechToTextManager: NSObject {
     // Safe to call again on relaunch if a previous download was interrupted —
     // the underlying downloader resumes partial files rather than restarting.
     func prepareOnOptIn() async {
-        await prepareOnOptIn(for: activeModelVariant)
-    }
-
-    private func prepareOnOptIn(for variant: ModelVariant) async {
         UserDefaults.standard.set(true, forKey: Self.optedInKey)
-        
-        if canUseSpeechAnalyzer {
-            publishModelState(.ready, for: variant)
-            return
-        }
-
-        if let existingTask = existingPrepareTask(for: variant) {
-            await existingTask.value
-            return
-        }
-
-        let task = Task<Void, Never> { [weak self] in
-            guard let self else { return }
-            await self.runPrepareOnOptIn(for: variant)
-        }
-        setPrepareTask(task, for: variant)
-        await task.value
-        clearPrepareTask(for: variant)
-    }
-
-    private func runPrepareOnOptIn(for variant: ModelVariant) async {
-        if isModelLoaded(for: variant) {
-            publishModelState(.ready, for: variant)
-            return
-        }
-
-        if await loadInstalledModelsIfAvailable(for: variant) {
-            return
-        }
-
-        if Self.modelSource == .bundled {
-            await loadBundledModels(for: variant)
-            return
-        }
-
-        publishModelState(.downloading(DownloadStatus(progress: 0, downloadedBytes: 0, totalBytes: 0)), for: variant)
-
-        do {
-            let selectedModelFolder: URL
-
-            if Self.modelSource == .cdn {
-                selectedModelFolder = try await downloadFromCDN(variant: variant)
-            } else if Self.modelSource == .huggingface {
-                selectedModelFolder = try await WhisperKit.download(variant: variant.modelName, from: Self.modelRepo)
-            } else {
-                publishModelState(.failed("Unsupported model source."), for: variant)
-                return
-            }
-
-            publishModelState(.loadingModel(loaded: 0, total: 1), for: variant)
-            try await loadModelWithRetry(variant: variant, from: selectedModelFolder)
-
-            UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
-            publishModelState(.ready, for: variant)
-        } catch is CancellationError {
-            publishModelState(.failed("Download cancelled. Tap Retry to resume."), for: variant)
-        } catch {
-            publishModelState(.failed(error.localizedDescription), for: variant)
-        }
-    }
-
-    private func loadBundledModels(for variant: ModelVariant) async {
-        guard let sourceFolder = bundledModelURL(for: variant) else {
-            publishModelState(.failed("Bundled model '\(variant.modelName)' not found in app bundle"), for: variant)
-            return
-        }
-
-        do {
-            publishModelState(.loadingModel(loaded: 0, total: 1), for: variant)
-            let modelFolder = try prepareBundledModelFolder(for: variant, sourceFolder: sourceFolder)
-            try await loadModelWithRetry(variant: variant, from: modelFolder)
-            UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
-            publishModelState(.ready, for: variant)
-        } catch {
-            publishModelState(.failed(error.localizedDescription), for: variant)
-        }
+        UserDefaults.standard.set(true, forKey: Self.modelReadyKey)
+        modelState = .ready
     }
 
     /// Call at app launch. Three outcomes:
@@ -374,7 +484,7 @@ final class SpeechToTextManager: NSObject {
     ///   resumes the download automatically, UI should show the progress screen
     func restoreIfAlreadyDownloaded() async {
         guard hasOptedIn else { return }
-        await prepareOnOptIn(for: activeModelVariant)
+        await prepareOnOptIn()
     }
 
     /// Call this at any entry point where the user tries to use the feature
@@ -382,261 +492,31 @@ final class SpeechToTextManager: NSObject {
     /// if false, the caller should navigate to / show the download-progress UI
     /// instead of proceeding, and resume the download if it isn't already running.
     func gateFeatureUsage() async -> Bool {
-        _ = await ensureSpeechAnalyzerReadyForUse()
-        let activeVariant = activeModelVariant
-        let currentState = modelState(for: operationMode)
-        if case .ready = currentState { return true }
-        if hasOptedIn, case .downloading = currentState {
-            return false // already downloading, just show progress UI
-        }
-        if hasOptedIn, case .loadingModel = currentState {
-            return false // model downloaded, now being loaded into memory
-        }
-        if hasOptedIn {
-            await prepareOnOptIn(for: activeVariant) // opted in earlier, download never finished/started this session
-            if case .ready = modelState(for: operationMode) { return true }
-        }
-        return false
-    }
-
-    private func installedModelFolderURL(for variant: ModelVariant) -> URL? {
-        let fileManager = FileManager.default
-        let baseDir = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-
-        // 1. Plain location — where CDN-downloaded models land (see
-        //    destinationFolderURL in CDNModelDownloader), and also where a
-        //    bundled model lands if its files already use clean names.
-        let plainDestination = baseDir.appendingPathComponent(variant.installFolderName, isDirectory: true)
-        if isModelFolder(plainDestination, fileManager: fileManager) {
-            return plainDestination
-        }
-
-        // 2. Bundled-prepared location — only relevant for the tiny model when
-        //    modelSource == .bundled, where prepareBundledModelFolder() renames
-        //    the tiny_-prefixed bundle resource files into this folder.
-        let preparedDestination = baseDir.appendingPathComponent("BundledPreparedModels", isDirectory: true)
-            .appendingPathComponent(variant.installFolderName, isDirectory: true)
-        if isModelFolder(preparedDestination, fileManager: fileManager) {
-            return preparedDestination
-        }
-
-        // 3. Fallback — some packaging may nest the model one level deeper
-        //    than expected under the plain location; check its children.
-        let children = (try? fileManager.contentsOfDirectory(
-            at: plainDestination,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-
-        for child in children where isModelFolder(child, fileManager: fileManager) {
-            return child
-        }
-
-        return nil
-    }
-
-    private func bundledModelURL(for variant: ModelVariant) -> URL? {
-        let alternateModelName = variant.modelName.replacingOccurrences(of: "-", with: "_")
-        let modelNames = Array(Set([variant.modelName, alternateModelName]))
-        var candidates: [URL?] = []
-
-        for name in modelNames {
-            candidates.append(contentsOf: [
-                Bundle.main.url(forResource: name, withExtension: nil),
-                Bundle.main.url(forResource: name, withExtension: "bundle"),
-                Bundle.main.url(forResource: name, withExtension: nil, subdirectory: "Resource"),
-                Bundle.main.url(forResource: name, withExtension: "bundle", subdirectory: "Resource"),
-                Bundle.main.resourceURL?.appendingPathComponent(name, isDirectory: true),
-                Bundle.main.resourceURL?.appendingPathComponent("\(name).bundle", isDirectory: true),
-                Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
-                    .appendingPathComponent(name, isDirectory: true),
-                Bundle.main.resourceURL?.appendingPathComponent("Resource", isDirectory: true)
-                    .appendingPathComponent("\(name).bundle", isDirectory: true)
-            ])
-        }
-
-        for candidate in candidates.compactMap({ $0 }) where isBundledModelFolder(candidate, variant: variant) {
-            return candidate
-        }
-
-        return nil
-    }
-
-    private func isBundledModelFolder(_ url: URL, variant: ModelVariant) -> Bool {
-        let fileManager = FileManager.default
-        if isModelFolder(url, fileManager: fileManager) {
-            return true
-        }
-
-        guard variant == .tiny else { return false }
-
-        let requiredTinyNames = [
-            "tiny_MelSpectrogram.mlmodelc",
-            "tiny_AudioEncoder.mlmodelc",
-            "tiny_TextDecoder.mlmodelc",
-            "tiny_config.json"
-        ]
-        return requiredTinyNames.allSatisfy { name in
-            fileManager.fileExists(atPath: url.appendingPathComponent(name).path)
-        }
-    }
-
-    private func prepareBundledModelFolder(for variant: ModelVariant, sourceFolder: URL) throws -> URL {
-        if variant == .small {
-            return sourceFolder
-        }
-
-        let fileManager = FileManager.default
-        if isModelFolder(sourceFolder, fileManager: fileManager) {
-            return sourceFolder
-        }
-
-        let tempRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("BundledPreparedModels", isDirectory: true)
-        let destination = tempRoot.appendingPathComponent(variant.installFolderName, isDirectory: true)
-
-        // Skip recreation if a valid copy already exists — this is what lets
-        // Core ML's ANE compile cache actually persist across launches. Without
-        // this check, the destination gets deleted and recopied every single
-        // launch, giving every file a fresh modification time and invalidating
-        // whatever compile cache Core ML had built for it.
-        if isModelFolder(destination, fileManager: fileManager) {
-            return destination
-        }
-
-        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
-
-        let mappings: [(source: String, target: String)] = [
-            ("tiny_AudioEncoder.mlmodelc", "AudioEncoder.mlmodelc"),
-            ("tiny_MelSpectrogram.mlmodelc", "MelSpectrogram.mlmodelc"),
-            ("tiny_TextDecoder.mlmodelc", "TextDecoder.mlmodelc"),
-            ("tiny_config.json", "config.json"),
-            ("tiny_generation_config.json", "generation_config.json")
-        ]
-
-        for mapping in mappings {
-            let source = sourceFolder.appendingPathComponent(mapping.source)
-            let target = destination.appendingPathComponent(mapping.target)
-            if fileManager.fileExists(atPath: source.path) {
-                try fileManager.copyItem(at: source, to: target)
-            }
-        }
-
-        guard isModelFolder(destination, fileManager: fileManager) else {
-            throw STTError.notReady
-        }
-
-        return destination
-    }
-
-    private func loadInstalledModelsIfAvailable(for variant: ModelVariant) async -> Bool {
-        guard let modelFolder = installedModelFolderURL(for: variant) else {
-            return false
-        }
-
-        do {
-            publishModelState(.loadingModel(loaded: 0, total: 1), for: variant)
-            try await loadModelWithRetry(variant: variant, from: modelFolder)
-            publishModelState(.ready, for: variant)
-            return true
-        } catch {
-            return false
-        }
-    }
-
-    private func downloadFromCDN(variant: ModelVariant) async throws -> URL {
-        let downloader = variant == .tiny ? tinyCDNDownloader : smallCDNDownloader
-        return try await downloader.downloadAndUnzip(
-            modelZipURL: variant.cdnZipURL,
-            installFolderName: variant.installFolderName
-        ) { [weak self] transfer in
-            self?.updateDownloadState(for: variant, transfer: transfer)
-        }
-    }
-
-    private func updateDownloadState(for variant: ModelVariant, transfer: CDNModelDownloader.TransferProgress) {
-        updateDownloadState(
-            for: variant,
-            fraction: transfer.fraction,
-            downloadedBytes: transfer.downloadedBytes,
-            totalBytes: transfer.totalBytes
-        )
-    }
-
-    private func isModelFolder(_ url: URL, fileManager: FileManager) -> Bool {
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            return false
-        }
-
-        let requiredNames = [
-            "MelSpectrogram.mlmodelc",
-            "AudioEncoder.mlmodelc",
-            "TextDecoder.mlmodelc",
-            "config.json"
-        ]
-
-        return requiredNames.allSatisfy { name in
-            fileManager.fileExists(atPath: url.appendingPathComponent(name).path)
-        }
-    }
-
-    private func createWhisperKit(modelFolder: String, profile: ComputeProfile) async throws -> WhisperKit {
-        let preferredCompute: ModelComputeOptions
-        switch profile {
-        case .liveTinyFast:
-            preferredCompute = ModelComputeOptions(
-                melCompute: .cpuAndGPU,
-                audioEncoderCompute: .cpuAndNeuralEngine,
-                textDecoderCompute: .cpuAndNeuralEngine
-            )
-        case .finalSmallBalanced:
-            // Force CPU-only for final Small decode. On some devices/OS states,
-            // ANE compilation can fail at stop-time with:
-            // MILCompilerForANE ... "Couldn't communicate with a helper application".
-            // CPU-only is slower but significantly more reliable for completion.
-            preferredCompute = ModelComputeOptions(
-                melCompute: .cpuOnly,
-                audioEncoderCompute: .cpuOnly,
-                textDecoderCompute: .cpuOnly
-            )
-        }
-
-        do {
-            return try await WhisperKit(
-                modelFolder: modelFolder,
-                computeOptions: preferredCompute,
-                verbose: false
-            )
-        } catch {
-            let fallbackCompute = ModelComputeOptions(
-                melCompute: .cpuOnly,
-                audioEncoderCompute: .cpuOnly,
-                textDecoderCompute: .cpuOnly
-            )
-            return try await WhisperKit(
-                modelFolder: modelFolder,
-                computeOptions: fallbackCompute,
-                verbose: false
-            )
-        }
-    }
-
-    private func updateDownloadState(for variant: ModelVariant, fraction: Double, downloadedBytes: Int64, totalBytes: Int64) {
-        let clamped = max(0, min(1, fraction.isFinite ? fraction : 0))
-        publishModelState(.downloading(
-            DownloadStatus(
-                progress: clamped,
-                downloadedBytes: max(0, downloadedBytes),
-                totalBytes: max(0, totalBytes)
-            )
-        ), for: variant)
+        await refreshAdvancedAppleTranscriberCapabilityIfNeeded(force: true)
+        return true
     }
 
     // MARK: - Step 2: Mic capture
 
     func requestMicPermission() async -> Bool {
-        await withCheckedContinuation { continuation in
+        if #available(iOS 17.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted:
+                return true
+            case .denied:
+                return false
+            case .undetermined:
+                break
+            @unknown default:
+                break
+            }
+        } else {
+            let permission = AVAudioSession.sharedInstance().recordPermission
+            if permission == .granted { return true }
+            if permission == .denied { return false }
+        }
+
+        return await withCheckedContinuation { continuation in
             if #available(iOS 17.0, *) {
                 AVAudioApplication.requestRecordPermission { granted in
                     continuation.resume(returning: granted)
@@ -679,30 +559,6 @@ final class SpeechToTextManager: NSObject {
         }
     }
 
-    /// Best-effort warmup for the Tiny live decoder to reduce the first partial decode cost.
-    func prewarmLiveDecodeIfNeeded() {
-        guard !didPrewarmLiveDecode else { return }
-        guard let liveWhisperKit else { return }
-        didPrewarmLiveDecode = true
-
-        Task(priority: .utility) {
-            do {
-                var options = DecodingOptions()
-                options.language = SupportedLanguage.english.rawValue
-                options.detectLanguage = false
-                let silentAudio = Array(repeating: Float.zero, count: Int(targetSampleRate * 0.5))
-                _ = try await liveWhisperKit.transcribe(audioArray: silentAudio, decodeOptions: options)
-#if DEBUG
-                print("[LIVE_DEBUG][SpeechToTextManager] prewarm_live_decode_ready")
-#endif
-            } catch {
-#if DEBUG
-                print("[LIVE_DEBUG][SpeechToTextManager] prewarm_live_decode_failed error=\"\(error.localizedDescription)\"")
-#endif
-            }
-        }
-    }
-
     func startListening(
         autoStopOnSilence: Bool = false,
         silenceDuration: TimeInterval = 1.0,
@@ -722,6 +578,14 @@ final class SpeechToTextManager: NSObject {
         pendingLiveLockLanguage = nil
         pendingLiveLockConfirmations = 0
         lastLiveResolvedLanguage = nil
+        setAppleLiveFinalText(nil)
+        appleLiveStateLock.lock()
+        lastNonEmptyLiveTranscriptText = nil
+        appleLiveStateLock.unlock()
+        speechRecognizerCommittedWords = []
+        speechRecognizerLastHypothesisWords = []
+        speechRecognizerLastVolatileWords = []
+        speechRecognizerLastWindowStartTime = 0
         Task(priority: .utility) { [liveDecodeCoordinator] in
             await liveDecodeCoordinator.reset()
         }
@@ -730,6 +594,7 @@ final class SpeechToTextManager: NSObject {
         do {
             try session.setCategory(.record, mode: .measurement, options: .duckOthers)
             try session.setActive(true)
+            sttTrace("audio_session active=true category=\(session.category.rawValue) mode=\(session.mode.rawValue) sample_rate=\(session.sampleRate)")
         } catch {
             throw STTError.audioSessionFailure
         }
@@ -770,6 +635,11 @@ final class SpeechToTextManager: NSObject {
             self.bufferLock.lock()
             self.sampleBuffer.append(contentsOf: frames)
             self.bufferLock.unlock()
+
+            if self.selectedModelProvider == .appleModels,
+               self.useAdvancedAppleLiveTranscribers {
+                self.pushAudioBufferToAppleLiveSessionIfNeeded(outBuffer)
+            }
 
             let frameDuration = Double(outBuffer.frameLength) / self.targetSampleRate
             self.accumulatedRecordingDuration += frameDuration
@@ -822,6 +692,12 @@ final class SpeechToTextManager: NSObject {
             throw STTError.audioSessionFailure
         }
         isListening = true
+        if selectedModelProvider == .appleModels,
+           useAdvancedAppleLiveTranscribers {
+            Task(priority: .userInitiated) { [weak self] in
+                await self?.startAppleLiveSessionIfNeeded()
+            }
+        }
     }
 
     func stopListening() {
@@ -837,9 +713,115 @@ final class SpeechToTextManager: NSObject {
         accumulatedSilenceDuration = 0
         accumulatedRecordingDuration = 0
         hasTriggeredAutoStop = false
+        speechRecognizerCommittedWords = []
+        speechRecognizerLastHypothesisWords = []
+        speechRecognizerLastVolatileWords = []
+        speechRecognizerLastWindowStartTime = 0
         Task(priority: .utility) { [liveDecodeCoordinator] in
             await liveDecodeCoordinator.reset()
         }
+        if #available(iOS 26.0, *),
+           selectedModelProvider == .appleModels,
+           appleLiveCoordinator != nil {
+            Task(priority: .userInitiated) { [weak self] in
+                await self?.finalizeAppleLiveSessionIfNeeded()
+            }
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private var appleLiveCoordinator: AppleLiveTranscriptionCoordinator? {
+        get {
+            appleLiveStateLock.lock()
+            defer { appleLiveStateLock.unlock() }
+            return appleLiveCoordinatorBox as? AppleLiveTranscriptionCoordinator
+        }
+        set {
+            appleLiveStateLock.lock()
+            appleLiveCoordinatorBox = newValue
+            appleLiveStateLock.unlock()
+        }
+    }
+
+    private func pushAudioBufferToAppleLiveSessionIfNeeded(_ buffer: AVAudioPCMBuffer) {
+        guard #available(iOS 26.0, *), selectedModelProvider == .appleModels, useAdvancedAppleLiveTranscribers else { return }
+        guard let appleLiveCoordinator else { return }
+        guard let copiedBuffer = copyPCMBuffer(buffer) else { return }
+        appleLiveCoordinator.pushBuffer(copiedBuffer)
+    }
+
+    private func copyPCMBuffer(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: source.frameCapacity) else {
+            return nil
+        }
+        copy.frameLength = source.frameLength
+        guard let sourceChannelData = source.floatChannelData,
+              let copiedChannelData = copy.floatChannelData else {
+            return nil
+        }
+        let channelCount = Int(source.format.channelCount)
+        let frameCount = Int(source.frameLength)
+        for channel in 0..<channelCount {
+            copiedChannelData[channel].update(from: sourceChannelData[channel], count: frameCount)
+        }
+        return copy
+    }
+
+    private func startAppleLiveSessionIfNeeded() async {
+        // Start exactly one live analyzer session per recording start.
+        // This removes the old per-tick session churn that caused UI stalls.
+        guard #available(iOS 26.0, *), selectedModelProvider == .appleModels else { return }
+
+        guard beginAppleLiveSessionStartIfNeeded() else { return }
+
+        defer {
+            endAppleLiveSessionStartIfNeeded()
+        }
+
+        do {
+            armAppleAdvancedPath()
+            let coordinator = AppleLiveTranscriptionCoordinator()
+            let localeHint = speechAnalyzerLocaleHint(for: liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english)
+            let selection = try await coordinator.start(localeHint: localeHint)
+            appleLiveCoordinator = coordinator
+            sttTrace("engine_selected live=\(selection.engine.rawValue) reason=\"\(selection.reason)\" locale=\(selection.locale.identifier)")
+        } catch {
+            disarmAppleAdvancedPath()
+            sttTrace("engine_selected live=fallback reason=\"apple_live_stream_start_failed: \(error.localizedDescription)\"")
+            hasDisabledSpeechAnalyzerForSession = true
+        }
+    }
+
+    private func finalizeAppleLiveSessionIfNeeded() async {
+        // Finalize once on stop so volatile tail is committed before UI close.
+        guard #available(iOS 26.0, *) else { return }
+
+        guard let coordinator = takeAppleLiveCoordinator() else { return }
+
+        do {
+            try await coordinator.stop(finalize: true)
+            disarmAppleAdvancedPath()
+            let language = liveLockedLanguage ?? lastLiveResolvedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+            if let finalPartial = coordinator.latestLivePartial(language: language) {
+                setAppleLiveFinalText(finalPartial.text)
+            }
+        } catch {
+            sttTrace("apple_live_finalize_error error=\"\(error.localizedDescription)\"")
+        }
+    }
+
+    private func latestAppleLivePartialResult(preferredLanguage: SupportedLanguage?) -> LivePartialResult? {
+        guard #available(iOS 26.0, *) else { return nil }
+        let language = preferredLanguage ?? liveLockedLanguage ?? lastLiveResolvedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+
+        appleLiveStateLock.lock()
+        let coordinator = appleLiveCoordinatorBox as? AppleLiveTranscriptionCoordinator
+        appleLiveStateLock.unlock()
+        let partial = coordinator?.latestLivePartial(language: language)
+        if let text = partial?.text {
+            rememberLiveTranscriptTextIfNonEmpty(text)
+        }
+        return partial
     }
 
     // MARK: - Step 3: Transcription
@@ -848,6 +830,10 @@ final class SpeechToTextManager: NSObject {
     /// In live-streaming mode, this final decode is performed with the Small model
     /// for higher post-recording accuracy.
     func transcribe(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
+        if #available(iOS 26.0, *),
+           appleLiveCoordinator != nil {
+            await finalizeAppleLiveSessionIfNeeded()
+        }
         debugLogRuntimeConfiguration(reason: "final_transcribe")
         let preferredEngine = preferredFinalTranscriptionEngine()
         debugLogEngineSelection(
@@ -856,78 +842,22 @@ final class SpeechToTextManager: NSObject {
             detail: "mode=\(operationMode.rawValue) preferredLanguage=\(preferredLanguage?.rawValue ?? "auto")"
         )
         switch preferredEngine {
-        case .whisperKit:
-            return try await transcribeWithWhisperKit(preferredLanguage: preferredLanguage)
         case .speechAnalyzer:
             do {
                 return try await transcribeWithSpeechAnalyzer(preferredLanguage: preferredLanguage)
             } catch {
                 if shouldDisableSpeechAnalyzer(for: error) {
                     hasDisabledSpeechAnalyzerForSession = true
-#if DEBUG
-                    print("[LIVE_DEBUG][SpeechToTextManager] speech_analyzer_disabled_for_session reason=\"\(error.localizedDescription)\"")
-#endif
-                    return try await transcribeWithWhisperKit(preferredLanguage: preferredLanguage)
+                    publishBackendStatus()
+                    return try await transcribeWithDictationTranscriber(preferredLanguage: preferredLanguage)
                 }
                 throw error
             }
+        case .dictationTranscriber:
+            return try await transcribeWithDictationTranscriber(preferredLanguage: preferredLanguage)
+        case .speechRecognizer:
+            return try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
         }
-    }
-
-    private func transcribeWithWhisperKit(preferredLanguage: SupportedLanguage? = nil) async throws -> (text: String, language: SupportedLanguage) {
-#if DEBUG
-        print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase start")
-#endif
-        if isListening { stopListening() }
-
-        let audio = snapshotAudioBuffer()
-        guard !audio.isEmpty else { throw STTError.emptyRecording }
-
-        let startedAt = Date()
-#if DEBUG
-        print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase ensure_model_start")
-#endif
-        let (transcriptionWhisperKit, modelVariantUsed, shouldReleaseAfterDecode) = try await finalTranscriptionWhisperKit()
-#if DEBUG
-        print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase model_ready model=\(modelVariantUsed.modelName)")
-#endif
-        defer {
-            if shouldReleaseAfterDecode {
-                finalWhisperKit = nil
-            }
-        }
-
-        let resolvedLanguage: SupportedLanguage
-        if let preferredLanguage {
-            resolvedLanguage = preferredLanguage
-        } else {
-            resolvedLanguage = try await detectSupportedLanguage(audio: audio, using: transcriptionWhisperKit)
-        }
-        logDetectedLanguage(stage: "final_transcribe", language: resolvedLanguage)
-
-        var options = DecodingOptions()
-        options.language = resolvedLanguage.rawValue
-        options.detectLanguage = false
-
-#if DEBUG
-        print("[LIVE_DEBUG][SpeechToTextManager] final_decode_phase decode_start lang=\(resolvedLanguage.rawValue)")
-#endif
-        let results = try await transcriptionWhisperKit.transcribe(audioArray: audio, decodeOptions: options)
-        guard !results.isEmpty else { throw STTError.emptyRecording }
-
-        // WhisperKit may return multiple chunk-level results for longer recordings.
-        // Combine all chunk texts to avoid dropping earlier parts of the recording.
-        let text = results
-            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-#if DEBUG
-        print(
-            "[LIVE_DEBUG][SpeechToTextManager] final_decode model=\(modelVariantUsed.modelName) audio_s=\(String(format: "%.2f", Double(audio.count) / targetSampleRate)) latency_ms=\(Int(Date().timeIntervalSince(startedAt) * 1000))"
-        )
-#endif
-        return (text, resolvedLanguage)
     }
 
     /// Lightweight partial transcription for live preview while recording.
@@ -944,13 +874,18 @@ final class SpeechToTextManager: NSObject {
             engine: preferredEngine,
             detail: "mode=\(operationMode.rawValue) preferredLanguage=\(preferredLanguage?.rawValue ?? "auto")"
         )
+
+        if #available(iOS 26.0, *),
+           useAdvancedAppleLiveTranscribers {
+            // Apple path: use one continuous analyzer session and read snapshots,
+            // instead of re-transcribing rolling windows every tick.
+            if appleLiveCoordinator == nil {
+                await startAppleLiveSessionIfNeeded()
+            }
+            return latestAppleLivePartialResult(preferredLanguage: preferredLanguage)
+        }
+
         switch preferredEngine {
-        case .whisperKit:
-            return try await transcribePartialCurrentBufferWithWhisperKit(
-                preferredLanguage: preferredLanguage,
-                maxAudioSeconds: maxAudioSeconds,
-                minimumAudioSeconds: minimumAudioSeconds
-            )
         case .speechAnalyzer:
             do {
                 return try await transcribePartialCurrentBufferWithSpeechAnalyzer(
@@ -961,11 +896,8 @@ final class SpeechToTextManager: NSObject {
             } catch {
                 if shouldDisableSpeechAnalyzer(for: error) {
                     hasDisabledSpeechAnalyzerForSession = true
-#if DEBUG
-                    print("[LIVE_DEBUG][SpeechToTextManager] speech_analyzer_disabled_for_session reason=\"\(error.localizedDescription)\"")
-#endif
-                    _ = try await ensureModelLoaded(for: .tiny)
-                    return try await transcribePartialCurrentBufferWithWhisperKit(
+                    publishBackendStatus()
+                    return try await transcribePartialCurrentBufferWithSpeechRecognizer(
                         preferredLanguage: preferredLanguage,
                         maxAudioSeconds: maxAudioSeconds,
                         minimumAudioSeconds: minimumAudioSeconds
@@ -973,143 +905,17 @@ final class SpeechToTextManager: NSObject {
                 }
                 throw error
             }
+        case .dictationTranscriber:
+            return latestAppleLivePartialResult(preferredLanguage: preferredLanguage)
+        case .speechRecognizer:
+            return try await transcribePartialCurrentBufferWithSpeechRecognizer(
+                preferredLanguage: preferredLanguage,
+                maxAudioSeconds: maxAudioSeconds,
+                minimumAudioSeconds: minimumAudioSeconds
+            )
         }
     }
     
-    private func transcribePartialCurrentBufferWithWhisperKit(
-        preferredLanguage: SupportedLanguage? = nil,
-        maxAudioSeconds: Double = 8.0,
-        minimumAudioSeconds: Double = 0.8
-    ) async throws -> LivePartialResult? {
-        guard let liveWhisperKit else { throw STTError.notReady }
-        guard await beginLivePartialDecodeIfPossible() else {
-#if DEBUG
-            print("[LIVE_DEBUG][SpeechToTextManager] partial_decode_skip reason=busy")
-#endif
-            return nil
-        }
-        defer {
-            Task(priority: .utility) { [liveDecodeCoordinator] in
-                await liveDecodeCoordinator.end()
-            }
-        }
-
-        let decodeStartedAt = Date()
-        let fullAudio = snapshotAudioBuffer()
-        let minimumSamples = Int(targetSampleRate * max(0.2, minimumAudioSeconds))
-        guard fullAudio.count >= minimumSamples else { return nil }
-
-        let audioWindow = recentAudioWindow(fullAudio, maxSeconds: maxAudioSeconds)
-        let windowStartSample = max(0, fullAudio.count - audioWindow.count)
-        let windowStartTime = TimeInterval(windowStartSample) / targetSampleRate
-        let windowEndTime = TimeInterval(fullAudio.count) / targetSampleRate
-        let resolvedLanguage: SupportedLanguage
-        if let preferredLanguage {
-            resolvedLanguage = preferredLanguage
-        } else if let liveLockedLanguage {
-            resolvedLanguage = liveLockedLanguage
-            logDetectedLanguage(stage: "live_locked_reuse", language: resolvedLanguage)
-        } else {
-            let languageLockSamples = Int(targetSampleRate * max(1.0, liveLanguageLockMinimumSeconds))
-            if fullAudio.count >= languageLockSamples {
-                let languageWindow = recentAudioWindow(fullAudio, maxSeconds: liveLanguageLockMinimumSeconds + 1.0)
-                // Keep live-language detection on the Tiny engine so we don't contend
-                // with stop-time Small finalization on the same model instance.
-                if let detectedLanguage = try await detectSupportedLanguageForLiveLock(audio: languageWindow, using: liveWhisperKit) {
-                    if pendingLiveLockLanguage == detectedLanguage {
-                        pendingLiveLockConfirmations += 1
-                    } else {
-                        pendingLiveLockLanguage = detectedLanguage
-                        pendingLiveLockConfirmations = 1
-                    }
-
-                    if pendingLiveLockConfirmations >= liveLanguageLockConfirmationsRequired {
-                        liveLockedLanguage = detectedLanguage
-                        resolvedLanguage = detectedLanguage
-                        logDetectedLanguage(stage: "live_lock_from_small", language: detectedLanguage)
-                    } else {
-                        resolvedLanguage = preferredDeviceSupportedLanguage() ?? .english
-                        logDetectedLanguage(stage: "live_lock_waiting_confirmation", language: resolvedLanguage)
-                    }
-                } else {
-                    // Keep candidate state across occasional weak ticks instead of
-                    // resetting instantly; this helps lock language in noisy input.
-                    pendingLiveLockConfirmations = max(0, pendingLiveLockConfirmations - 1)
-                    resolvedLanguage = preferredDeviceSupportedLanguage() ?? .english
-                    logDetectedLanguage(stage: "live_lock_deferred_device_prior", language: resolvedLanguage)
-                }
-            } else {
-                // Before small model locks language, use device preference as a temporary prior.
-                resolvedLanguage = preferredDeviceSupportedLanguage() ?? .english
-                logDetectedLanguage(stage: "live_temporary_device_prior", language: resolvedLanguage)
-            }
-        }
-
-        var options = DecodingOptions()
-        options.language = resolvedLanguage.rawValue
-        options.detectLanguage = false
-
-#if DEBUG
-        print(
-            "[LIVE_DEBUG][SpeechToTextManager] partial_decode_start model=\(Self.tinyModelName) full_audio_s=\(String(format: "%.2f", Double(fullAudio.count) / targetSampleRate)) window_s=\(String(format: "%.2f", Double(audioWindow.count) / targetSampleRate)) lang=\(resolvedLanguage.rawValue)"
-        )
-#endif
-        let results = try await liveWhisperKit.transcribe(audioArray: audioWindow, decodeOptions: options)
-        guard !results.isEmpty else { return nil }
-
-        // For longer/complex windows WhisperKit can return multiple chunk results.
-        // Combine all chunk texts to avoid dropping live content.
-        let text = results
-            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
-
-        var segments: [LiveTranscriptSegment] = results.flatMap { result in
-            result.segments.compactMap { segment -> LiveTranscriptSegment? in
-                let trimmedText = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmedText.isEmpty else { return nil }
-                let absoluteStart = windowStartTime + TimeInterval(segment.start)
-                let absoluteEnd = windowStartTime + TimeInterval(segment.end)
-                guard absoluteEnd > absoluteStart else { return nil }
-                return LiveTranscriptSegment(
-                    startTime: absoluteStart,
-                    endTime: absoluteEnd,
-                    text: trimmedText
-                )
-            }
-        }
-        if segments.isEmpty {
-            segments = [
-                LiveTranscriptSegment(
-                    startTime: windowStartTime,
-                    endTime: windowEndTime,
-                    text: text
-                )
-            ]
-        } else {
-            segments.sort {
-                if $0.startTime == $1.startTime { return $0.endTime < $1.endTime }
-                return $0.startTime < $1.startTime
-            }
-        }
-        await liveDecodeCoordinator.markTextEmitted()
-        lastLiveResolvedLanguage = resolvedLanguage
-#if DEBUG
-        print(
-            "[LIVE_DEBUG][SpeechToTextManager] partial_decode_done latency_ms=\(Int(Date().timeIntervalSince(decodeStartedAt) * 1000)) text_chars=\(text.count) segments=\(segments.count)"
-        )
-#endif
-        return LivePartialResult(
-            text: text,
-            language: resolvedLanguage,
-            windowStartTime: windowStartTime,
-            windowEndTime: windowEndTime,
-            segments: segments
-        )
-    }
-
     private func beginLivePartialDecodeIfPossible() async -> Bool {
         await liveDecodeCoordinator.tryBegin(now: Date())
     }
@@ -1133,102 +939,6 @@ final class SpeechToTextManager: NSObject {
         return Array(audio.suffix(maxSamples))
     }
 
-    /// Runs Whisper's language-ID pass and picks the best match restricted to
-    /// `SupportedLanguage.allCases`, instead of accepting whatever it names freely.
-    private func detectSupportedLanguage(audio: [Float], using whisperKit: WhisperKit) async throws -> SupportedLanguage {
-        let probabilities = try await stableSupportedLanguageProbabilities(audio: audio, using: whisperKit)
-        let sorted = probabilities.sorted { $0.value > $1.value }
-        let top = sorted.first
-        let second = sorted.dropFirst().first
-        let topConfidence = top?.value ?? 0
-        let margin = topConfidence - (second?.value ?? 0)
-
-        // Use device language as a soft prior only when language-ID is ambiguous.
-        if let deviceLanguage = preferredDeviceSupportedLanguage(),
-           let deviceConfidence = probabilities[deviceLanguage] {
-            let weakPrediction = topConfidence < 0.45 || margin < 0.12
-            if weakPrediction, deviceConfidence >= topConfidence * 0.7 {
-                return deviceLanguage
-            }
-        }
-
-        // Fallback: if language ID genuinely returned nothing for our set
-        // (e.g. silence), default to the first supported language rather than crash.
-        return top?.key ?? preferredDeviceSupportedLanguage() ?? .english
-    }
-
-    /// Builds a more stable final language decision by averaging language-ID
-    /// probabilities over multiple windows instead of trusting one pass.
-    private func stableSupportedLanguageProbabilities(
-        audio: [Float],
-        using whisperKit: WhisperKit
-    ) async throws -> [SupportedLanguage: Double] {
-        let minimumWindowSamples = Int(targetSampleRate * 1.2)
-        guard audio.count >= minimumWindowSamples else {
-            return try await supportedLanguageProbabilities(audio: audio, using: whisperKit)
-        }
-
-        let fullWindow = recentAudioWindow(audio, maxSeconds: 30)
-        let tailWindow = recentAudioWindow(audio, maxSeconds: 10)
-        let headWindow: [Float] = {
-            let maxHeadSamples = Int(targetSampleRate * 10)
-            if audio.count <= maxHeadSamples { return audio }
-            return Array(audio.prefix(maxHeadSamples))
-        }()
-
-        let weightedWindows: [(samples: [Float], weight: Double)] = [
-            (fullWindow, 0.35),
-            (tailWindow, 0.45),
-            (headWindow, 0.20)
-        ]
-
-        var aggregate: [SupportedLanguage: Double] = [:]
-        var totalWeight: Double = 0
-        for (samples, weight) in weightedWindows where samples.count >= minimumWindowSamples {
-            let probabilities = try await supportedLanguageProbabilities(audio: samples, using: whisperKit)
-            for language in SupportedLanguage.allCases {
-                aggregate[language, default: 0] += (probabilities[language] ?? 0) * weight
-            }
-            totalWeight += weight
-        }
-
-        guard totalWeight > 0 else {
-            return try await supportedLanguageProbabilities(audio: audio, using: whisperKit)
-        }
-
-        var normalized: [SupportedLanguage: Double] = [:]
-        for language in SupportedLanguage.allCases {
-            normalized[language] = (aggregate[language] ?? 0) / totalWeight
-        }
-        return normalized
-    }
-
-    private func detectSupportedLanguageForLiveLock(audio: [Float], using whisperKit: WhisperKit) async throws -> SupportedLanguage? {
-        let probabilities = try await supportedLanguageProbabilities(audio: audio, using: whisperKit)
-        let sorted = probabilities.sorted { $0.value > $1.value }
-        guard let top = sorted.first else { return nil }
-        let second = sorted.dropFirst().first?.value ?? 0
-        let confidence = top.value
-        let margin = confidence - second
-
-        // Be stricter before locking language for the session.
-        let minConfidenceToLock: Double = 0.45
-        let minMarginToLock: Double = 0.08
-        guard confidence >= minConfidenceToLock, margin >= minMarginToLock else {
-            return nil
-        }
-        return top.key
-    }
-
-    private func supportedLanguageProbabilities(audio: [Float], using whisperKit: WhisperKit) async throws -> [SupportedLanguage: Double] {
-        let (_, langProbs) = try await whisperKit.detectLangauge(audioArray: audio)
-        var probabilities: [SupportedLanguage: Double] = [:]
-        for language in SupportedLanguage.allCases {
-            probabilities[language] = Double(langProbs[language.rawValue] ?? 0)
-        }
-        return probabilities
-    }
-
     private func preferredDeviceSupportedLanguage() -> SupportedLanguage? {
         guard let preferredLocale = Locale.preferredLanguages.first?.lowercased() else {
             return nil
@@ -1240,210 +950,46 @@ final class SpeechToTextManager: NSObject {
         return nil
     }
 
-    private func modelVariant(for mode: OperationMode) -> ModelVariant {
-        switch mode {
-        case .liveStreaming:
-            return .tiny
-        case .postRecording:
-            return .small
-        }
-    }
-
-    private var activeModelVariant: ModelVariant {
-        modelVariant(for: operationMode)
-    }
-
-    private func isModelLoaded(for variant: ModelVariant) -> Bool {
-        switch variant {
-        case .tiny:
-            return liveWhisperKit != nil
-        case .small:
-            return finalWhisperKit != nil
-        }
-    }
-
-    private func resolvedModelState(for variant: ModelVariant) -> ModelState {
-        if canUseSpeechAnalyzer, case .ready = modelStateWithoutSpeechAnalyzerOverride(for: variant) {
-            return .ready
-        }
-        return modelStateWithoutSpeechAnalyzerOverride(for: variant)
-    }
-
-    private func modelStateWithoutSpeechAnalyzerOverride(for variant: ModelVariant) -> ModelState {
-        if isModelLoaded(for: variant) {
-            return .ready
-        }
-        return modelStateByVariant[variant] ?? .notDownloaded
-    }
-
-    private func publishModelState(_ state: ModelState, for variant: ModelVariant) {
-        modelStateByVariant[variant] = state
-        if variant == activeModelVariant {
-            modelState = state
-        }
-    }
-
-    private func existingPrepareTask(for variant: ModelVariant) -> Task<Void, Never>? {
-        prepareTaskLock.lock()
-        defer { prepareTaskLock.unlock() }
-        return inFlightPrepareTasks[variant]
-    }
-
-    private func setPrepareTask(_ task: Task<Void, Never>, for variant: ModelVariant) {
-        prepareTaskLock.lock()
-        inFlightPrepareTasks[variant] = task
-        prepareTaskLock.unlock()
-    }
-
-    private func clearPrepareTask(for variant: ModelVariant) {
-        prepareTaskLock.lock()
-        inFlightPrepareTasks[variant] = nil
-        prepareTaskLock.unlock()
-    }
-
-    private var isActiveModelLoaded: Bool {
-        switch operationMode {
-        case .liveStreaming:
-            return liveWhisperKit != nil
-        case .postRecording:
-            return finalWhisperKit != nil
-        }
-    }
-
-    private var activeTranscriptionWhisperKit: WhisperKit? {
-        switch operationMode {
-        case .liveStreaming:
-            return liveWhisperKit
-        case .postRecording:
-            return finalWhisperKit
-        }
-    }
-
-    private func finalTranscriptionWhisperKit() async throws -> (whisper: WhisperKit, model: ModelVariant, releaseAfterDecode: Bool) {
-        switch operationMode {
-        case .liveStreaming:
-            let small = try await ensureModelLoaded(for: .small)
-            // Keep Small cached after first load to avoid stop-time hangs on subsequent sessions.
-            return (small, .small, false)
-        case .postRecording:
-            let small = try await ensureModelLoaded(for: .small)
-            return (small, .small, false)
-        }
-    }
-
-    private func ensureModelLoaded(for variant: ModelVariant) async throws -> WhisperKit {
-        switch variant {
-        case .tiny:
-            if let liveWhisperKit { return liveWhisperKit }
-        case .small:
-            if let finalWhisperKit { return finalWhisperKit }
-        }
-
-        let modelFolder: URL
-        if let installed = installedModelFolderURL(for: variant) {
-            modelFolder = installed
-        } else if Self.modelSource == .bundled {
-            guard let sourceFolder = bundledModelURL(for: variant) else {
-                throw STTError.notReady
-            }
-            modelFolder = try prepareBundledModelFolder(for: variant, sourceFolder: sourceFolder)
-        } else {
-            modelFolder = try await downloadFromCDN(variant: variant)
-        }
-
-        try await loadModelWithRetry(variant: variant, from: modelFolder)
-
-        switch variant {
-        case .tiny:
-            guard let liveWhisperKit else { throw STTError.notReady }
-            return liveWhisperKit
-        case .small:
-            guard let finalWhisperKit else { throw STTError.notReady }
-            return finalWhisperKit
-        }
-    }
-
-    /// Best-effort background warmup to reduce first stop-time latency in live mode.
-    func prewarmSmallFinalModelIfNeeded() {
-        guard !canUseSpeechAnalyzer else { return }
-        if isLiveTranscriptionEnabled {
-#if DEBUG
-            print("[LIVE_DEBUG][SpeechToTextManager] prewarm_small_skipped reason=live_mode_on")
-#endif
-            return
-        }
-        guard !isPrewarmingSmallModel, finalWhisperKit == nil else { return }
-        isPrewarmingSmallModel = true
-        Task(priority: .utility) { [weak self] in
-            guard let self else { return }
-            defer { self.isPrewarmingSmallModel = false }
-            do {
-                _ = try await self.ensureModelLoaded(for: .small)
-#if DEBUG
-                print("[LIVE_DEBUG][SpeechToTextManager] prewarm_small_ready")
-#endif
-            } catch {
-#if DEBUG
-                print("[LIVE_DEBUG][SpeechToTextManager] prewarm_small_failed error=\"\(error.localizedDescription)\"")
-#endif
-            }
-        }
-    }
-
-    private func loadModel(variant: ModelVariant, from folder: URL) async throws {
-        switch variant {
-        case .tiny:
-            liveWhisperKit = try await createWhisperKit(
-                modelFolder: folder.path,
-                profile: .liveTinyFast
-            )
-        case .small:
-            finalWhisperKit = try await createWhisperKit(
-                modelFolder: folder.path,
-                profile: .finalSmallBalanced
-            )
-        }
-    }
-
-    private func loadModelWithRetry(variant: ModelVariant, from folder: URL) async throws {
-        do {
-            try await loadModel(variant: variant, from: folder)
-        } catch {
-            let message = error.localizedDescription.lowercased()
-            let shouldRetry =
-                message.contains("tokenizer_config.json")
-                || message.contains("couldn't be moved")
-                || message.contains("couldn’t be moved")
-                || message.contains(".incomplete")
-            guard shouldRetry else { throw error }
-            try? await Task.sleep(nanoseconds: 650_000_000)
-            try await loadModel(variant: variant, from: folder)
-        }
-    }
-    
     private func preferredFinalTranscriptionEngine() -> TranscriptionEngine {
-        canUseSpeechAnalyzer ? .speechAnalyzer : .whisperKit
+        if #available(iOS 26.0, *) {
+            if !useAdvancedAppleLiveTranscribers {
+                return .speechRecognizer
+            }
+            return canUseSpeechAnalyzer ? .speechAnalyzer : .dictationTranscriber
+        }
+        return .speechRecognizer
     }
     
     private func preferredLivePartialEngine() -> TranscriptionEngine {
-        canUseSpeechAnalyzer ? .speechAnalyzer : .whisperKit
+        if #available(iOS 26.0, *) {
+            if !useAdvancedAppleLiveTranscribers {
+                return .speechRecognizer
+            }
+            return canUseSpeechAnalyzer ? .speechAnalyzer : .dictationTranscriber
+        }
+        return .speechRecognizer
     }
     
     private var canAttemptSpeechAnalyzer: Bool {
-        guard useSpeechAnalyzerWhenAvailable else { return false }
+        guard selectedModelProvider == .appleModels else { return false }
         guard !hasDisabledSpeechAnalyzerForSession else { return false }
-        if #available(iOS 26.0, *) {
-            return true
-        }
-        return false
+        return useAdvancedAppleLiveTranscribers
     }
 
     private var canUseSpeechAnalyzer: Bool {
-        canAttemptSpeechAnalyzer && hasValidatedSpeechAnalyzerForSession
+        canAttemptSpeechAnalyzer
     }
     
     private func transcribeWithSpeechAnalyzer(preferredLanguage: SupportedLanguage?) async throws -> (text: String, language: SupportedLanguage) {
         guard #available(iOS 26.0, *), canUseSpeechAnalyzer else { throw STTError.notReady }
+        if let finalText = getAppleLiveFinalText()?.trimmingCharacters(in: .whitespacesAndNewlines), !finalText.isEmpty {
+            let language = preferredLanguage ?? liveLockedLanguage ?? lastLiveResolvedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+            return (finalText, language)
+        }
+        if let partial = latestAppleLivePartialResult(preferredLanguage: preferredLanguage) {
+            return (partial.text, partial.language)
+        }
+
         if isListening { stopListening() }
         let audio = snapshotAudioBuffer()
         guard !audio.isEmpty else { throw STTError.emptyRecording }
@@ -1462,6 +1008,48 @@ final class SpeechToTextManager: NSObject {
             preset: .transcription
         )
         let resolvedLanguage = supportedLanguage(from: output.locale, fallback: preferredLanguage)
+        lastLiveResolvedLanguage = resolvedLanguage
+        let normalizedOutput = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalizedOutput.isEmpty,
+           operationMode == .liveStreaming,
+           let fallback = getLastNonEmptyLiveTranscriptText(),
+           !fallback.isEmpty {
+            return (fallback, resolvedLanguage)
+        }
+        return (output.text, resolvedLanguage)
+    }
+
+    private func transcribeWithDictationTranscriber(preferredLanguage: SupportedLanguage?) async throws -> (text: String, language: SupportedLanguage) {
+        if #available(iOS 26.0, *) {
+            if let finalText = getAppleLiveFinalText()?.trimmingCharacters(in: .whitespacesAndNewlines), !finalText.isEmpty {
+                let language = preferredLanguage ?? liveLockedLanguage ?? lastLiveResolvedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+                return (finalText, language)
+            }
+            if let partial = latestAppleLivePartialResult(preferredLanguage: preferredLanguage) {
+                return (partial.text, partial.language)
+            }
+        }
+        return try await transcribeWithSpeechRecognizer(preferredLanguage: preferredLanguage)
+    }
+
+    private func transcribeWithSpeechRecognizer(preferredLanguage: SupportedLanguage?) async throws -> (text: String, language: SupportedLanguage) {
+        if isListening { stopListening() }
+        let audio = snapshotAudioBuffer()
+        guard !audio.isEmpty else { throw STTError.emptyRecording }
+        let languageHint = preferredLanguage ?? liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+        let localeHint = speechAnalyzerLocaleHint(for: languageHint)
+        let engine = SpeechRecognizerTranscriptionEngine()
+        debugLogEngineSelection(
+            phase: "speech_recognizer_final",
+            engine: .speechRecognizer,
+            detail: "localeHint=\(localeHint?.identifier ?? "auto") audio_s=\(String(format: "%.2f", Double(audio.count) / targetSampleRate))"
+        )
+        let output = try await engine.transcribe(
+            audio: audio,
+            sampleRate: targetSampleRate,
+            localeHint: localeHint
+        )
+        let resolvedLanguage = supportedLanguage(from: output.locale, fallback: languageHint)
         lastLiveResolvedLanguage = resolvedLanguage
         return (output.text, resolvedLanguage)
     }
@@ -1535,6 +1123,184 @@ final class SpeechToTextManager: NSObject {
         )
     }
 
+    private func transcribePartialCurrentBufferWithSpeechRecognizer(
+        preferredLanguage: SupportedLanguage?,
+        maxAudioSeconds: Double,
+        minimumAudioSeconds: Double
+    ) async throws -> LivePartialResult? {
+        guard await beginLivePartialDecodeIfPossible() else { return nil }
+        defer {
+            Task(priority: .utility) { [liveDecodeCoordinator] in
+                await liveDecodeCoordinator.end()
+            }
+        }
+
+        let fullAudio = snapshotAudioBuffer()
+        let minimumSamples = Int(targetSampleRate * max(0.2, minimumAudioSeconds))
+        guard fullAudio.count >= minimumSamples else { return nil }
+
+        // Keep extended context for Apple recognizer live mode, but cap window to
+        // limit heavy re-decodes that can stall responsiveness on long sessions.
+        let audioWindow = recentAudioWindow(fullAudio, maxSeconds: max(maxAudioSeconds, 24.0))
+        let windowStartSample = max(0, fullAudio.count - audioWindow.count)
+        let windowStartTime = TimeInterval(windowStartSample) / targetSampleRate
+        let windowEndTime = TimeInterval(fullAudio.count) / targetSampleRate
+        let languageHint = preferredLanguage ?? liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
+        let localeHint = speechAnalyzerLocaleHint(for: languageHint)
+        let engine = SpeechRecognizerTranscriptionEngine()
+        debugLogEngineSelection(
+            phase: "speech_recognizer_partial",
+            engine: .speechRecognizer,
+            detail: "localeHint=\(localeHint?.identifier ?? "auto") window_s=\(String(format: "%.2f", Double(audioWindow.count) / targetSampleRate))"
+        )
+        let output = try await engine.transcribe(
+            audio: audioWindow,
+            sampleRate: targetSampleRate,
+            localeHint: localeHint
+        )
+        let rawText = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawText.isEmpty else { return nil }
+
+        let resolvedLanguage = supportedLanguage(from: output.locale, fallback: languageHint)
+        if pendingLiveLockLanguage == resolvedLanguage {
+            pendingLiveLockConfirmations += 1
+        } else {
+            pendingLiveLockLanguage = resolvedLanguage
+            pendingLiveLockConfirmations = 1
+        }
+        if pendingLiveLockConfirmations >= liveLanguageLockConfirmationsRequired {
+            liveLockedLanguage = resolvedLanguage
+        }
+        lastLiveResolvedLanguage = resolvedLanguage
+        await liveDecodeCoordinator.markTextEmitted()
+
+        let currentWords = transcriptWords(from: rawText)
+        guard !currentWords.isEmpty else { return nil }
+        let split = stabilizedSpeechRecognizerSplit(
+            for: currentWords,
+            windowStartTime: windowStartTime
+        )
+        let renderedText = joinCommittedVolatileText(committed: split.committed, volatile: split.volatile)
+
+        let segments = [
+            LiveTranscriptSegment(
+                startTime: windowStartTime,
+                endTime: windowEndTime,
+                text: renderedText
+            )
+        ]
+        return LivePartialResult(
+            text: renderedText,
+            language: resolvedLanguage,
+            windowStartTime: windowStartTime,
+            windowEndTime: windowEndTime,
+            segments: segments,
+            committedText: split.committed,
+            volatileText: split.volatile
+        )
+    }
+
+    private func stabilizedSpeechRecognizerSplit(
+        for currentWords: [String],
+        windowStartTime: TimeInterval
+    ) -> (committed: String, volatile: String) {
+        if speechRecognizerLastHypothesisWords.isEmpty {
+            speechRecognizerLastHypothesisWords = currentWords
+            speechRecognizerLastVolatileWords = currentWords
+            speechRecognizerLastWindowStartTime = windowStartTime
+            return ("", currentWords.joined(separator: " "))
+        }
+
+        let previousVolatileWords = speechRecognizerLastVolatileWords
+        let didWindowAdvance = windowStartTime > speechRecognizerLastWindowStartTime + 0.05
+        if didWindowAdvance, !previousVolatileWords.isEmpty {
+            // Rolling-window mode: when the recognizer drops old audio context, it
+            // often returns a shifted hypothesis. Commit the dropped prefix from
+            // the previous volatile tail only, so already-committed content is
+            // never appended again.
+            let overlap = maxWordOverlapSuffixPrefix(previous: previousVolatileWords, current: currentWords)
+            if overlap >= 3, previousVolatileWords.count > overlap {
+                let droppedPrefix = Array(previousVolatileWords.prefix(previousVolatileWords.count - overlap))
+                appendCommittedWords(droppedPrefix)
+            }
+        }
+
+        let sharedWithPrevious = sharedWordPrefixCount(lhs: speechRecognizerLastHypothesisWords, rhs: currentWords)
+        let candidateCommitCount = max(0, sharedWithPrevious - speechRecognizerMutableTailWordCount)
+        if candidateCommitCount > 0 {
+            appendCommittedWords(Array(currentWords.prefix(candidateCommitCount)))
+        }
+
+        let boundaryOverlap = maxWordOverlapSuffixPrefix(previous: speechRecognizerCommittedWords, current: currentWords)
+        let volatileWords = boundaryOverlap < currentWords.count
+            ? Array(currentWords.dropFirst(boundaryOverlap))
+            : []
+
+        speechRecognizerLastHypothesisWords = currentWords
+        speechRecognizerLastVolatileWords = volatileWords
+        speechRecognizerLastWindowStartTime = windowStartTime
+        let committed = speechRecognizerCommittedWords.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let volatile = volatileWords.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (committed, volatile)
+    }
+
+    private func transcriptWords(from text: String) -> [String] {
+        text
+            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    private func sharedWordPrefixCount(lhs: [String], rhs: [String]) -> Int {
+        let maxCount = min(lhs.count, rhs.count)
+        var index = 0
+        while index < maxCount {
+            if normalizedSpeechWord(lhs[index]) != normalizedSpeechWord(rhs[index]) {
+                break
+            }
+            index += 1
+        }
+        return index
+    }
+
+    private func maxWordOverlapSuffixPrefix(previous: [String], current: [String]) -> Int {
+        guard !previous.isEmpty, !current.isEmpty else { return 0 }
+        let limit = min(previous.count, current.count)
+        for size in stride(from: limit, through: 1, by: -1) {
+            var matches = true
+            for index in 0..<size {
+                if normalizedSpeechWord(previous[previous.count - size + index]) != normalizedSpeechWord(current[index]) {
+                    matches = false
+                    break
+                }
+            }
+            if matches { return size }
+        }
+        return 0
+    }
+
+    private func appendCommittedWords(_ candidateWords: [String]) {
+        guard !candidateWords.isEmpty else { return }
+        let overlap = maxWordOverlapSuffixPrefix(previous: speechRecognizerCommittedWords, current: candidateWords)
+        if overlap < candidateWords.count {
+            speechRecognizerCommittedWords.append(contentsOf: candidateWords.dropFirst(overlap))
+        }
+    }
+
+    private func normalizedSpeechWord(_ word: String) -> String {
+        word
+            .trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
+            .lowercased()
+    }
+
+    private func joinCommittedVolatileText(committed: String, volatile: String) -> String {
+        let prefix = committed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tail = volatile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prefix.isEmpty else { return tail }
+        guard !tail.isEmpty else { return prefix }
+        return prefix + " " + tail
+    }
+
     private func shouldDisableSpeechAnalyzer(for error: Error) -> Bool {
         if error is CancellationError { return false }
         let message = error.localizedDescription.lowercased()
@@ -1547,7 +1313,7 @@ final class SpeechToTextManager: NSObject {
             return true
         }
         // In live usage, any recurring SpeechAnalyzer runtime error should
-        // fail open to WhisperKit for this run instead of spamming retries.
+        // fail open to SpeechRecognizer for this run instead of spamming retries.
         return true
     }
 
@@ -1556,6 +1322,23 @@ final class SpeechToTextManager: NSObject {
         guard !hasValidatedSpeechAnalyzerForSession else { return true }
         guard #available(iOS 26.0, *) else { return false }
 
+        if let existing = currentSpeechAnalyzerValidationTask() {
+            return await existing.task.value
+        }
+
+        let taskID = UUID()
+        let task = Task<Bool, Never> { [weak self] in
+            guard let self else { return false }
+            return await self.performSpeechAnalyzerReadinessProbe()
+        }
+        setSpeechAnalyzerValidationTask(task, id: taskID)
+        let result = await task.value
+        clearSpeechAnalyzerValidationTask(ifID: taskID)
+        return result
+    }
+
+    @available(iOS 26.0, *)
+    private func performSpeechAnalyzerReadinessProbe() async -> Bool {
         do {
             let engine = SpeechAnalyzerTranscriptionEngine()
             let preferred = liveLockedLanguage ?? preferredDeviceSupportedLanguage() ?? .english
@@ -1573,17 +1356,54 @@ final class SpeechToTextManager: NSObject {
                 preset: .progressiveTranscription
             )
             hasValidatedSpeechAnalyzerForSession = true
-#if DEBUG
-            print("[LIVE_DEBUG][SpeechToTextManager] speech_analyzer_preflight_ready mode=prepare_plus_probe")
-#endif
+            publishBackendStatus()
             return true
         } catch {
             hasDisabledSpeechAnalyzerForSession = true
             hasValidatedSpeechAnalyzerForSession = false
-#if DEBUG
-            print("[LIVE_DEBUG][SpeechToTextManager] speech_analyzer_preflight_failed reason=\"\(error.localizedDescription)\"")
-#endif
+            publishBackendStatus()
             return false
+        }
+    }
+
+    private func currentSpeechAnalyzerValidationTask() -> (id: UUID, task: Task<Bool, Never>)? {
+        speechAnalyzerValidationTaskLock.lock()
+        defer { speechAnalyzerValidationTaskLock.unlock() }
+        guard let id = speechAnalyzerValidationTaskID, let task = speechAnalyzerValidationTask else {
+            return nil
+        }
+        return (id: id, task: task)
+    }
+
+    private func setSpeechAnalyzerValidationTask(_ task: Task<Bool, Never>, id: UUID) {
+        speechAnalyzerValidationTaskLock.lock()
+        defer { speechAnalyzerValidationTaskLock.unlock() }
+        speechAnalyzerValidationTaskID = id
+        speechAnalyzerValidationTask = task
+    }
+
+    private func clearSpeechAnalyzerValidationTask(ifID id: UUID) {
+        speechAnalyzerValidationTaskLock.lock()
+        defer { speechAnalyzerValidationTaskLock.unlock() }
+        if speechAnalyzerValidationTaskID == id {
+            speechAnalyzerValidationTaskID = nil
+            speechAnalyzerValidationTask = nil
+        }
+    }
+
+    private func cancelSpeechAnalyzerValidationTaskIfNeeded() {
+        speechAnalyzerValidationTaskLock.lock()
+        speechAnalyzerValidationTaskID = nil
+        let task = speechAnalyzerValidationTask
+        speechAnalyzerValidationTask = nil
+        speechAnalyzerValidationTaskLock.unlock()
+        task?.cancel()
+    }
+
+    private func publishBackendStatus() {
+        let label = backendStatusLabel
+        DispatchQueue.main.async { [weak self] in
+            self?.onBackendStatusChange?(label)
         }
     }
 
@@ -1613,32 +1433,536 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func debugLogRuntimeConfiguration(reason: String) {
-#if DEBUG
-        guard !hasLoggedRuntimeConfig else { return }
-        hasLoggedRuntimeConfig = true
-        let source: String
-        switch Self.modelSource {
-        case .bundled:
-            source = "bundled"
-        case .cdn:
-            source = "cdn"
-        case .huggingface:
-            source = "huggingface"
-        }
-        print(
-            "[LIVE_DEBUG][SpeechToTextManager] runtime_config reason=\(reason) useSpeechAnalyzerWhenAvailable=\(useSpeechAnalyzerWhenAvailable) canUseSpeechAnalyzer=\(canUseSpeechAnalyzer) modelSource=\(source) operationMode=\(operationMode.rawValue) liveModel=\(Self.tinyModelName) finalModel=\(Self.smallModelName)"
-        )
-#endif
+        sttTrace("runtime reason=\(reason) mode=\(operationMode.rawValue) provider=\(selectedModelProvider.rawValue)")
     }
 
     private func debugLogEngineSelection(phase: String, engine: TranscriptionEngine, detail: String) {
-#if DEBUG
-        print("[LIVE_DEBUG][SpeechToTextManager] engine_selected phase=\(phase) engine=\(engine.rawValue) \(detail)")
-#endif
+        sttTrace("engine phase=\(phase) selected=\(engine.rawValue) detail=\(detail)")
     }
 
     private func logDetectedLanguage(stage: String, language: SupportedLanguage) {
-        _ = stage
-        _ = language
+        sttTrace("language stage=\(stage) value=\(language.rawValue)")
+    }
+
+    @objc
+    private func handleAudioSessionInterruption(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeRaw = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else {
+            return
+        }
+
+        switch type {
+        case .began:
+            sttTrace("interruption began; stopping audio session")
+            stopListening()
+        case .ended:
+            sttTrace("interruption ended")
+        @unknown default:
+            break
+        }
+    }
+
+    private func sttTrace(_ message: String) {
+#if DEBUG
+        print("[STT_TRACE][SpeechToTextManager] \(message)")
+#else
+        _ = message
+#endif
+    }
+}
+
+@available(iOS 26.0, *)
+final class AppleLiveTranscriptionCoordinator {
+    enum EngineKind: String {
+        case speechTranscriber
+        case dictationTranscriber
+    }
+
+    struct EngineSelection {
+        let engine: EngineKind
+        let locale: Locale
+        let reason: String
+        let sessionID: UUID
+    }
+
+    private struct Entry {
+        let start: TimeInterval
+        let end: TimeInterval
+        let text: String
+        var isFinal: Bool
+    }
+
+    private let stateLock = NSLock()
+    private var entries: [Entry] = []
+    private var latestFinalizationTime: TimeInterval = 0
+    private var latestWindowEnd: TimeInterval = 0
+    private var latestLocale: Locale = .current
+    private enum LifecycleState: String {
+        case idle
+        case starting
+        case running
+        case stopping
+        case failed
+    }
+    private let lifecycleLock = NSLock()
+    private var lifecycleState: LifecycleState = .idle
+    private var activeSessionID: UUID?
+
+    private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var analyzer: SpeechAnalyzer?
+    private var analyzeTask: Task<Void, Never>?
+    private var resultsTask: Task<Void, Never>?
+    private var analyzerInputFormat: AVAudioFormat?
+    private let inputQueue = DispatchQueue(label: "AppleLiveTranscriptionCoordinator.inputQueue", qos: .userInitiated)
+    private var hasLoggedFirstInputBuffer = false
+
+    private var hasLoggedEngineSelection = false
+
+    func start(localeHint: Locale?) async throws -> EngineSelection {
+        let sessionID = UUID()
+        let priorState = lifecycleLock.withLock { lifecycleState }
+        if priorState == .running || priorState == .starting || priorState == .stopping {
+            try await stop(finalize: false)
+        }
+        transitionLifecycle(to: .starting, sessionID: sessionID, detail: "phase=start_begin")
+        resetTranscriptState()
+        hasLoggedFirstInputBuffer = false
+
+        let resolved = try await resolveEngine(localeHint: localeHint, sessionID: sessionID)
+        trace("session=\(sessionID.uuidString) phase=before_input_sequence")
+        let stream = AsyncStream<AnalyzerInput> { continuation in
+            self.inputContinuation = continuation
+        }
+        trace("session=\(sessionID.uuidString) phase=after_input_sequence")
+
+        do {
+            switch resolved.engine {
+            case .speechTranscriber:
+                trace("session=\(sessionID.uuidString) phase=before_transcriber_init engine=speechTranscriber")
+                trace("session=\(sessionID.uuidString) phase=create_transcriber engine=speechTranscriber locale=\(resolved.locale.identifier)")
+                let preset = SpeechTranscriber.Preset(
+                    transcriptionOptions: [],
+                    reportingOptions: [.volatileResults, .fastResults],
+                    attributeOptions: []
+                )
+                let transcriber = SpeechTranscriber(locale: resolved.locale, preset: preset)
+                trace("session=\(sessionID.uuidString) phase=after_transcriber_init engine=speechTranscriber")
+                trace("session=\(sessionID.uuidString) phase=before_asset_check engine=speechTranscriber")
+                trace("session=\(sessionID.uuidString) phase=asset_check engine=speechTranscriber")
+                try await ensureAssetsReady(module: transcriber)
+                trace("session=\(sessionID.uuidString) phase=after_asset_check engine=speechTranscriber")
+
+                trace("session=\(sessionID.uuidString) phase=before_analyzer_init engine=speechTranscriber")
+                trace("session=\(sessionID.uuidString) phase=create_analyzer engine=speechTranscriber")
+                let analyzer = SpeechAnalyzer(modules: [transcriber])
+                trace("session=\(sessionID.uuidString) phase=after_analyzer_init engine=speechTranscriber")
+                let defaultFormat = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: 16_000,
+                    channels: 1,
+                    interleaved: false
+                )
+                let expectedFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) ?? defaultFormat
+                guard let expectedFormat else {
+                    throw NSError(
+                        domain: "AppleLiveTranscriptionCoordinator",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to determine analyzer input format"]
+                    )
+                }
+                analyzerInputFormat = expectedFormat
+                trace("session=\(sessionID.uuidString) phase=prepare_to_analyze sample_rate=\(expectedFormat.sampleRate) channels=\(expectedFormat.channelCount)")
+                trace("session=\(sessionID.uuidString) phase=before_prepare_to_analyze")
+                try await analyzer.prepareToAnalyze(in: expectedFormat)
+                trace("session=\(sessionID.uuidString) phase=after_prepare_to_analyze")
+                self.analyzer = analyzer
+                self.latestLocale = resolved.locale
+
+                trace("session=\(sessionID.uuidString) phase=before_recognition_task engine=speechTranscriber")
+                self.resultsTask = Task(priority: .userInitiated) { [weak self] in
+                    guard let self else { return }
+                    do {
+                        for try await result in transcriber.results {
+                            guard self.isSessionActive(sessionID) else { return }
+                            self.applyResult(
+                                range: result.range,
+                                resultsFinalizationTime: result.resultsFinalizationTime,
+                                text: result.text,
+                                isFinal: result.isFinal,
+                                locale: resolved.locale
+                            )
+                        }
+                    } catch {
+                        if self.isSessionActive(sessionID) {
+                            self.trace("session=\(sessionID.uuidString) phase=results_stream_error engine=speechTranscriber error=\"\(error.localizedDescription)\"")
+                        }
+                    }
+                }
+                trace("session=\(sessionID.uuidString) phase=recognition_running engine=speechTranscriber")
+
+                trace("session=\(sessionID.uuidString) phase=before_set_input_sequence")
+                trace("session=\(sessionID.uuidString) phase=set_input_sequence")
+                trace("session=\(sessionID.uuidString) phase=after_set_input_sequence")
+                trace("session=\(sessionID.uuidString) phase=before_analyzer_start")
+                trace("session=\(sessionID.uuidString) phase=analyzer_start")
+                try await analyzer.start(inputSequence: stream)
+                trace("session=\(sessionID.uuidString) phase=after_analyzer_start")
+
+            case .dictationTranscriber:
+                trace("session=\(sessionID.uuidString) phase=before_transcriber_init engine=dictationTranscriber")
+                trace("session=\(sessionID.uuidString) phase=create_transcriber engine=dictationTranscriber locale=\(resolved.locale.identifier)")
+                let preset = DictationTranscriber.Preset.progressiveLongDictation
+                let transcriber = DictationTranscriber(locale: resolved.locale, preset: preset)
+                trace("session=\(sessionID.uuidString) phase=after_transcriber_init engine=dictationTranscriber")
+                trace("session=\(sessionID.uuidString) phase=before_asset_check engine=dictationTranscriber")
+                trace("session=\(sessionID.uuidString) phase=asset_check engine=dictationTranscriber")
+                try await ensureAssetsReady(module: transcriber)
+                trace("session=\(sessionID.uuidString) phase=after_asset_check engine=dictationTranscriber")
+
+                trace("session=\(sessionID.uuidString) phase=before_analyzer_init engine=dictationTranscriber")
+                trace("session=\(sessionID.uuidString) phase=create_analyzer engine=dictationTranscriber")
+                let analyzer = SpeechAnalyzer(modules: [transcriber])
+                trace("session=\(sessionID.uuidString) phase=after_analyzer_init engine=dictationTranscriber")
+                let defaultFormat = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: 16_000,
+                    channels: 1,
+                    interleaved: false
+                )
+                let expectedFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) ?? defaultFormat
+                guard let expectedFormat else {
+                    throw NSError(
+                        domain: "AppleLiveTranscriptionCoordinator",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to determine analyzer input format"]
+                    )
+                }
+                analyzerInputFormat = expectedFormat
+                trace("session=\(sessionID.uuidString) phase=prepare_to_analyze sample_rate=\(expectedFormat.sampleRate) channels=\(expectedFormat.channelCount)")
+                trace("session=\(sessionID.uuidString) phase=before_prepare_to_analyze")
+                try await analyzer.prepareToAnalyze(in: expectedFormat)
+                trace("session=\(sessionID.uuidString) phase=after_prepare_to_analyze")
+                self.analyzer = analyzer
+                self.latestLocale = resolved.locale
+
+                trace("session=\(sessionID.uuidString) phase=before_recognition_task engine=dictationTranscriber")
+                self.resultsTask = Task(priority: .userInitiated) { [weak self] in
+                    guard let self else { return }
+                    do {
+                        for try await result in transcriber.results {
+                            guard self.isSessionActive(sessionID) else { return }
+                            self.applyResult(
+                                range: result.range,
+                                resultsFinalizationTime: result.resultsFinalizationTime,
+                                text: result.text,
+                                isFinal: result.isFinal,
+                                locale: resolved.locale
+                            )
+                        }
+                    } catch {
+                        if self.isSessionActive(sessionID) {
+                            self.trace("session=\(sessionID.uuidString) phase=results_stream_error engine=dictationTranscriber error=\"\(error.localizedDescription)\"")
+                        }
+                    }
+                }
+                trace("session=\(sessionID.uuidString) phase=recognition_running engine=dictationTranscriber")
+
+                trace("session=\(sessionID.uuidString) phase=before_set_input_sequence")
+                trace("session=\(sessionID.uuidString) phase=set_input_sequence")
+                trace("session=\(sessionID.uuidString) phase=after_set_input_sequence")
+                trace("session=\(sessionID.uuidString) phase=before_analyzer_start")
+                trace("session=\(sessionID.uuidString) phase=analyzer_start")
+                try await analyzer.start(inputSequence: stream)
+                trace("session=\(sessionID.uuidString) phase=after_analyzer_start")
+            }
+        } catch {
+            transitionLifecycle(to: .failed, sessionID: sessionID, detail: "phase=start_failed error=\"\(error.localizedDescription)\"")
+            try? await stop(finalize: false)
+            throw error
+        }
+
+        if !hasLoggedEngineSelection {
+            trace("session=\(sessionID.uuidString) phase=engine_selected live=\(resolved.engine.rawValue) locale=\(resolved.locale.identifier) reason=\"\(resolved.reason)\"")
+            hasLoggedEngineSelection = true
+        }
+        transitionLifecycle(to: .running, sessionID: sessionID, detail: "phase=running")
+
+        return EngineSelection(
+            engine: resolved.engine,
+            locale: resolved.locale,
+            reason: resolved.reason,
+            sessionID: sessionID
+        )
+    }
+
+    func pushBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard buffer.frameLength > 0 else { return }
+        guard let continuation = inputContinuation else { return }
+        guard let expectedFormat = analyzerInputFormat else { return }
+        guard let sessionID = lifecycleLock.withLock({
+            lifecycleState == .running ? activeSessionID : nil
+        }) else { return }
+
+        inputQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.isSessionActive(sessionID) else { return }
+            guard let inputBuffer = self.convertBufferIfNeeded(buffer, to: expectedFormat) else {
+                self.trace("session=\(sessionID.uuidString) phase=push_buffer_dropped reason=conversion_failed")
+                return
+            }
+            let shouldLogFirstBuffer = !self.hasLoggedFirstInputBuffer
+            if shouldLogFirstBuffer {
+                self.trace("session=\(sessionID.uuidString) phase=before_first_input_buffer sample_rate=\(inputBuffer.format.sampleRate) channels=\(inputBuffer.format.channelCount)")
+            }
+            continuation.yield(AnalyzerInput(buffer: inputBuffer))
+            if shouldLogFirstBuffer {
+                self.trace("session=\(sessionID.uuidString) phase=after_first_input_buffer")
+                self.hasLoggedFirstInputBuffer = true
+            }
+        }
+    }
+
+    func latestLivePartial(language: SpeechToTextManager.SupportedLanguage) -> SpeechToTextManager.LivePartialResult? {
+        stateLock.lock()
+        let sorted = entries.sorted { lhs, rhs in
+            if lhs.start == rhs.start { return lhs.end < rhs.end }
+            return lhs.start < rhs.start
+        }
+
+        let committed = sorted
+            .filter { $0.isFinal }
+            .map(\.text)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let volatile = sorted
+            .filter { !$0.isFinal }
+            .map(\.text)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let windowEnd = latestWindowEnd
+        let windowStart = max(0, latestFinalizationTime)
+        stateLock.unlock()
+
+        let rendered = join(committed: committed, volatile: volatile)
+        guard !rendered.isEmpty else { return nil }
+
+        let segments = [
+            LiveTranscriptSegment(startTime: 0, endTime: windowStart, text: committed),
+            LiveTranscriptSegment(startTime: windowStart, endTime: windowEnd, text: volatile)
+        ].filter { !$0.text.isEmpty && $0.endTime >= $0.startTime }
+
+        return SpeechToTextManager.LivePartialResult(
+            text: rendered,
+            language: language,
+            windowStartTime: windowStart,
+            windowEndTime: windowEnd,
+            segments: segments,
+            committedText: committed,
+            volatileText: volatile
+        )
+    }
+
+    func stop(finalize: Bool) async throws {
+        guard let sessionID = lifecycleLock.withLock({ activeSessionID }) else {
+            return
+        }
+        transitionLifecycle(to: .stopping, sessionID: sessionID, detail: "phase=stop_begin finalize=\(finalize)")
+        inputContinuation?.finish()
+        inputContinuation = nil
+
+        if finalize, let analyzer {
+            do {
+                trace("session=\(sessionID.uuidString) phase=finalize_and_finish")
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
+            } catch {
+                trace("session=\(sessionID.uuidString) phase=finalize_error error=\"\(error.localizedDescription)\"")
+            }
+        }
+
+        if !finalize {
+            trace("session=\(sessionID.uuidString) phase=cancel_and_finish_now")
+            await analyzer?.cancelAndFinishNow()
+        }
+
+        analyzeTask?.cancel()
+        resultsTask?.cancel()
+        analyzeTask = nil
+        resultsTask = nil
+        self.analyzer = nil
+        analyzerInputFormat = nil
+        lifecycleLock.withLock {
+            activeSessionID = nil
+        }
+        hasLoggedEngineSelection = false
+        transitionLifecycle(to: .idle, sessionID: sessionID, detail: "phase=stopped")
+    }
+
+    private func resolveEngine(localeHint: Locale?, sessionID: UUID) async throws -> EngineSelection {
+        let preferred = localeHint ?? Locale.current
+        trace("session=\(sessionID.uuidString) phase=availability_check preferred_locale=\(preferred.identifier)")
+
+        // Strict preference: use SpeechTranscriber whenever available and locale-supported.
+        if SpeechTranscriber.isAvailable,
+           let locale = await SpeechTranscriber.supportedLocale(equivalentTo: preferred) {
+            return EngineSelection(
+                engine: .speechTranscriber,
+                locale: locale,
+                reason: "Strict preference: SpeechTranscriber.supportedLocale(equivalentTo:)",
+                sessionID: sessionID
+            )
+        }
+
+        trace("session=\(sessionID.uuidString) phase=availability_check speech_transcriber_unavailable_or_locale_unsupported preferred=\(preferred.identifier)")
+
+        if let locale = await DictationTranscriber.supportedLocale(equivalentTo: preferred) {
+            return EngineSelection(
+                engine: .dictationTranscriber,
+                locale: locale,
+                reason: "SpeechTranscriber unavailable/unsupported; fallback DictationTranscriber.supportedLocale(equivalentTo:)",
+                sessionID: sessionID
+            )
+        }
+
+        trace("session=\(sessionID.uuidString) phase=availability_check no_supported_locale")
+        throw NSError(
+            domain: "AppleLiveTranscriptionCoordinator",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "No supported locale equivalent to \(preferred.identifier)"]
+        )
+    }
+
+    private func ensureAssetsReady(module: some LocaleDependentSpeechModule) async throws {
+        if let installationRequest = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
+            try await installationRequest.downloadAndInstall()
+        }
+    }
+
+    private func applyResult(
+        range: CMTimeRange,
+        resultsFinalizationTime: CMTime,
+        text: AttributedString,
+        isFinal: Bool,
+        locale: Locale
+    ) {
+        let start = max(0, seconds(range.start))
+        let end = max(start, seconds(range.end))
+        let finalization = max(0, seconds(resultsFinalizationTime))
+        let normalizedText = String(text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        stateLock.lock()
+        latestLocale = locale
+        latestFinalizationTime = max(latestFinalizationTime, finalization)
+        latestWindowEnd = max(latestWindowEnd, end)
+
+        entries.removeAll { existing in
+            let overlaps = existing.start < end && start < existing.end
+            if !overlaps { return false }
+            return !existing.isFinal || existing.end > finalization
+        }
+
+        if !normalizedText.isEmpty {
+            entries.append(
+                Entry(
+                    start: start,
+                    end: end,
+                    text: normalizedText,
+                    isFinal: isFinal || finalization >= end - 0.0001
+                )
+            )
+        }
+
+        entries = entries.map { entry in
+            var updated = entry
+            if updated.end <= finalization + 0.0001 {
+                updated.isFinal = true
+            }
+            return updated
+        }
+        stateLock.unlock()
+    }
+
+    private func seconds(_ time: CMTime) -> TimeInterval {
+        guard time.isNumeric else { return 0 }
+        return CMTimeGetSeconds(time)
+    }
+
+    private func join(committed: String, volatile: String) -> String {
+        let prefix = committed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tail = volatile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prefix.isEmpty else { return tail }
+        guard !tail.isEmpty else { return prefix }
+        return prefix + " " + tail
+    }
+
+    private func resetTranscriptState() {
+        stateLock.lock()
+        entries.removeAll()
+        latestFinalizationTime = 0
+        latestWindowEnd = 0
+        stateLock.unlock()
+    }
+
+    private func convertBufferIfNeeded(_ buffer: AVAudioPCMBuffer, to expectedFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+        if isAudioFormat(buffer.format, equivalentTo: expectedFormat) {
+            return buffer
+        }
+
+        guard let converter = AVAudioConverter(from: buffer.format, to: expectedFormat) else {
+            return nil
+        }
+        let ratio = expectedFormat.sampleRate / buffer.format.sampleRate
+        let outputCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: expectedFormat, frameCapacity: outputCapacity) else {
+            return nil
+        }
+
+        var conversionError: NSError?
+        var didSupplyInput = false
+        converter.convert(to: outputBuffer, error: &conversionError) { _, status in
+            if didSupplyInput {
+                status.pointee = .endOfStream
+                return nil
+            }
+            didSupplyInput = true
+            status.pointee = .haveData
+            return buffer
+        }
+
+        guard conversionError == nil, outputBuffer.frameLength > 0 else {
+            return nil
+        }
+        return outputBuffer
+    }
+
+    private func isAudioFormat(_ lhs: AVAudioFormat, equivalentTo rhs: AVAudioFormat) -> Bool {
+        lhs.commonFormat == rhs.commonFormat
+            && lhs.channelCount == rhs.channelCount
+            && lhs.isInterleaved == rhs.isInterleaved
+            && abs(lhs.sampleRate - rhs.sampleRate) < 0.5
+    }
+
+    private func transitionLifecycle(to next: LifecycleState, sessionID: UUID, detail: String) {
+        lifecycleLock.lock()
+        lifecycleState = next
+        activeSessionID = (next == .idle) ? nil : sessionID
+        lifecycleLock.unlock()
+        trace("session=\(sessionID.uuidString) state=\(next.rawValue) \(detail)")
+    }
+
+    private func isSessionActive(_ sessionID: UUID) -> Bool {
+        lifecycleLock.withLock {
+            activeSessionID == sessionID && (lifecycleState == .starting || lifecycleState == .running)
+        }
+    }
+
+    private func trace(_ message: String) {
+#if DEBUG
+        print("[STT_TRACE][AppleLive] \(message)")
+#else
+        _ = message
+#endif
     }
 }
