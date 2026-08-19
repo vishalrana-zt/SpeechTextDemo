@@ -45,6 +45,7 @@ struct RootView: View {
     @State private var selectedLanguage: SpeechToTextManager.SupportedLanguage = RootView.defaultSupportedLanguage()
     @State private var selectedMode: CaptureMode = .liveStreaming
     @State private var isNoteEditorFocused = false
+    @State private var isTextAISheetPresented = false
     private let bottomPanelReservedHeight: CGFloat = 60
     private let invalidTranscriptMarkers: [String] = [
         "SwiftUI.ModifiedContent<",
@@ -117,6 +118,15 @@ struct RootView: View {
             .padding(.bottom, isSpeechToTextSheetPresented ? bottomPanelReservedHeight : 0)
             .navigationTitle("Notes")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        isTextAISheetPresented = true
+                    } label: {
+                        Image(systemName: "character.textbox")
+                    }
+                    .accessibilityLabel("Open offline text AI")
+                }
+
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
@@ -150,6 +160,9 @@ struct RootView: View {
         }
         .onAppear {
             manager.setModelProvider(.appleModels)
+        }
+        .fullScreenCover(isPresented: $isTextAISheetPresented) {
+            TextAIPrototypeView()
         }
     }
 
