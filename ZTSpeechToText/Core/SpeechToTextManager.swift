@@ -446,10 +446,22 @@ final class SpeechToTextManager: NSObject {
         }
         if !force, shouldSkipAdvancedAppleCapabilityRefresh() { return }
 
-        let isAvailable = SpeechTranscriber.isAvailable
-        let locales = await SpeechTranscriber.supportedLocales
-        let runtimeCapable = isAvailable && !locales.isEmpty
+        let preferredLanguage = effectiveSessionLanguage(preferredLanguage: nil)
+        let preferredLocale = speechAnalyzerLocaleHint(for: preferredLanguage) ?? Locale.current
+
+        let dictationSupportedLocale = await DictationTranscriber.supportedLocale(equivalentTo: preferredLocale)
+        let speechSupportedLocale: Locale?
+        if SpeechTranscriber.isAvailable {
+            speechSupportedLocale = await SpeechTranscriber.supportedLocale(equivalentTo: preferredLocale)
+        } else {
+            speechSupportedLocale = nil
+        }
+
+        let runtimeCapable = (dictationSupportedLocale != nil) || (speechSupportedLocale != nil)
         let enabled = runtimeCapable && isAdvancedApplePathExplicitlyEnabled
+        debugTrace(
+            "apple_runtime_capability preferred=\(preferredLocale.identifier) dictation=\(dictationSupportedLocale != nil) speech=\(speechSupportedLocale != nil) enabled=\(enabled)"
+        )
         setAdvancedAppleTranscriberCapability(enabled, checked: true)
         publishBackendStatus()
     }
@@ -1902,6 +1914,7 @@ final class SpeechToTextManager: NSObject {
     }
 
     private func debugTrace(_ message: String) {
+        STTSessionLogger.shared.log(source: "SpeechToTextManager", message: message)
 #if DEBUG
         print("[STT_TRACE][SpeechToTextManager] \(message)")
 #endif

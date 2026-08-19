@@ -47,15 +47,52 @@ final class SpeechRecognizerTranscriptionEngine {
         try await ensureSpeechAuthorization()
 
         let locale = try resolveLocale(localeHint: localeHint)
+        STTSessionLogger.shared.log(
+            source: "SpeechRecognizerEngine",
+            message: "transcribe begin locale=\(locale.identifier) audio_s=\(String(format: "%.2f", Double(audio.count) / sampleRate)) timeout_s=\(timeoutInterval ?? -1)"
+        )
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
+            STTSessionLogger.shared.log(source: "SpeechRecognizerEngine", message: "transcribe fail reason=recognizer_unavailable locale=\(locale.identifier)")
             throw EngineError.unavailableRecognizer
         }
 
         let fileURL = try writeAudioToTemporaryFile(audio: audio, sampleRate: sampleRate)
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
+        let maxAttempts = (timeoutInterval == nil) ? 3 : 2
+        var attempt = 0
+        while true {
+            do {
+                return try await transcribeOnce(
+                    recognizer: recognizer,
+                    fileURL: fileURL,
+                    locale: locale,
+                    timeoutInterval: timeoutInterval
+                )
+            } catch {
+                attempt += 1
+                guard attempt < maxAttempts, shouldRetryRecognition(error) else {
+                    throw error
+                }
+                try? await Task.sleep(nanoseconds: 450_000_000)
+            }
+        }
+#endif
+    }
+
+    private func transcribeOnce(
+        recognizer: SFSpeechRecognizer,
+        fileURL: URL,
+        locale: Locale,
+        timeoutInterval: TimeInterval?
+    ) async throws -> SpeechRecognizerTranscriptionOutput {
         let request = SFSpeechURLRecognitionRequest(url: fileURL)
         request.shouldReportPartialResults = true
+        request.taskHint = .dictation
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
+        request.addsPunctuation = true
 
         return try await withCheckedThrowingContinuation { continuation in
             let lock = NSLock()
@@ -77,8 +114,10 @@ final class SpeechRecognizerTranscriptionEngine {
                         finish {
                             task?.cancel()
                             if text.isEmpty {
+                                STTSessionLogger.shared.log(source: "SpeechRecognizerEngine", message: "transcribe fail reason=no_final_text locale=\(locale.identifier)")
                                 continuation.resume(throwing: EngineError.noRecognitionResult)
                             } else {
+                                STTSessionLogger.shared.log(source: "SpeechRecognizerEngine", message: "transcribe ok locale=\(locale.identifier) chars=\(text.count)")
                                 continuation.resume(returning: SpeechRecognizerTranscriptionOutput(text: text, locale: locale))
                             }
                         }
@@ -90,6 +129,10 @@ final class SpeechRecognizerTranscriptionEngine {
                     finish {
                         task?.cancel()
                         let mapped = self.mapRecognitionError(error)
+                        STTSessionLogger.shared.log(
+                            source: "SpeechRecognizerEngine",
+                            message: "transcribe fail locale=\(locale.identifier) raw=\(error.localizedDescription) mapped=\((mapped as NSError).localizedDescription)"
+                        )
                         continuation.resume(throwing: mapped)
                     }
                 }
@@ -106,18 +149,32 @@ final class SpeechRecognizerTranscriptionEngine {
                             code: -1001,
                             userInfo: [NSLocalizedDescriptionKey: "Speech recognizer request timed out."]
                         )
+                        STTSessionLogger.shared.log(source: "SpeechRecognizerEngine", message: "transcribe fail reason=timeout locale=\(locale.identifier)")
                         continuation.resume(throwing: timeoutError)
                     }
                 }
             }
         }
-#endif
+    }
+
+    private func shouldRetryRecognition(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == "kAFAssistantErrorDomain" {
+            if nsError.code == 203 || nsError.code == 209 || nsError.code == 1101 || nsError.code == 1 {
+                return true
+            }
+        }
+        let message = error.localizedDescription.lowercased()
+        return message == "retry"
+            || message.contains("speech recognizer is currently unavailable")
     }
 
     private func mapRecognitionError(_ error: Error) -> Error {
         let nsError = error as NSError
-        if nsError.domain == "kAFAssistantErrorDomain", nsError.code == 1101 {
-            return EngineError.unavailableRecognizer
+        if nsError.domain == "kAFAssistantErrorDomain" {
+            if nsError.code == 203 || nsError.code == 209 || nsError.code == 1101 || nsError.code == 1 {
+                return EngineError.unavailableRecognizer
+            }
         }
         return error
     }
