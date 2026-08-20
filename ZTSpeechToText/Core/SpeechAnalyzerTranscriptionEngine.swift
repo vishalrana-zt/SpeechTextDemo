@@ -49,10 +49,20 @@ final class SpeechAnalyzerTranscriptionEngine {
     ) async throws -> SpeechAnalyzerTranscriptionOutput {
         guard !audio.isEmpty else { throw EngineError.emptyAudio }
         try await ensureSpeechAuthorization()
-
+        
         let locale = try await resolveLocale(localeHint: localeHint)
+
+        // Reserve for the ENTIRE operation — asset install AND analysis — not
+        // just installation. Releasing right after install (an earlier version
+        // of this fix) let analyzeSequence run against an already-unallocated
+        // locale, producing "Cannot use modules with unallocated locales".
+        try await AssetInventory.reserve(locale: locale)
+        defer {
+            Task { await AssetInventory.release(reservedLocale: locale) }
+        }
+        
         let transcriber = SpeechTranscriber(locale: locale, preset: preset)
-        try await ensureAssetsReady(for: transcriber, locale: locale)
+        try await ensureAssetsInstalled(for: transcriber, locale: locale)
 
         let fileURL = try writeAudioToTemporaryFile(audio: audio, sampleRate: sampleRate)
         defer { try? FileManager.default.removeItem(at: fileURL) }
@@ -108,8 +118,17 @@ final class SpeechAnalyzerTranscriptionEngine {
     ) async throws {
         try await ensureSpeechAuthorization()
         let locale = try await resolveLocale(localeHint: localeHint)
+
+        // Same reserve-for-duration pattern as transcribe(); this readiness
+        // probe also runs an actual decode (see performSpeechAnalyzerReadinessProbe
+        // in SpeechToTextManager), so the reservation must outlive install.
+        try await AssetInventory.reserve(locale: locale)
+        defer {
+            Task { await AssetInventory.release(reservedLocale: locale) }
+        }
+        
         let transcriber = SpeechTranscriber(locale: locale, preset: preset)
-        try await ensureAssetsReady(for: transcriber, locale: locale)
+        try await ensureAssetsInstalled(for: transcriber, locale: locale)
     }
 
     private func ensureSpeechAuthorization() async throws {
@@ -151,21 +170,17 @@ final class SpeechAnalyzerTranscriptionEngine {
         return resolved
     }
 
-    private func ensureAssetsReady(for transcriber: SpeechTranscriber, locale: Locale) async throws {
+    /// Installs assets for `locale` if needed. Caller is responsible for
+    /// reserving/releasing the locale for the duration it's actually used —
+    /// this function only handles the one-time asset download/install.
+    private func ensureAssetsInstalled(for transcriber: SpeechTranscriber, locale: Locale) async throws {
         if await Self.assetPreparationState.isPrepared(locale: locale) {
             return
         }
-        try await reserveLocaleForAssets(locale)
-
         if let installationRequest = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
             try await installationRequest.downloadAndInstall()
         }
-
         await Self.assetPreparationState.markPrepared(locale: locale)
-    }
-
-    private func reserveLocaleForAssets(_ locale: Locale) async throws {
-        _ = try await AssetInventory.reserve(locale: locale)
     }
 
     private func writeAudioToTemporaryFile(audio: [Float], sampleRate: Double) throws -> URL {

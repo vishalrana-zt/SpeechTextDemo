@@ -67,6 +67,7 @@ struct RootView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .disabled(isSpeechToTextSheetPresented)
 
                     Picker("Mode", selection: $selectedMode) {
                         ForEach(CaptureMode.allCases) { mode in
@@ -74,6 +75,7 @@ struct RootView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .disabled(isSpeechToTextSheetPresented)
 
                 }
 
@@ -167,6 +169,8 @@ struct RootView: View {
         }
         .onChange(of: selectedLanguage) { _ in
             STTSessionLogger.shared.log(source: "RootView", message: "ui language_changed=\(selectedLanguage.rawValue)")
+            resetLiveDraftState()
+            manager.resetSessionStateForLanguageChange(selectedLanguage)
         }
         .onChange(of: noteText) { value in
             STTSessionLogger.shared.log(
@@ -508,15 +512,28 @@ struct RootView: View {
         let liveWords = words(from: liveTrimmed).map(normalizedWord).filter { !$0.isEmpty }
         guard !finalWords.isEmpty, !liveWords.isEmpty else { return finalTrimmed }
 
+        // If final looks like a shifted tail of live preview, preserve dropped prefix.
+        if let droppedPrefix = droppedLeadingPrefix(previous: liveTrimmed, current: finalTrimmed) {
+            return stitchWords(left: droppedPrefix, right: finalTrimmed)
+        }
+
         let finalSet = Set(finalWords)
         let liveSet = Set(liveWords)
         let intersection = finalSet.intersection(liveSet).count
         let union = finalSet.union(liveSet).count
         let overlap = union > 0 ? Double(intersection) / Double(union) : 0
 
+        let sharedPrefix = sharedWordPrefixCount(lhs: words(from: liveTrimmed), rhs: words(from: finalTrimmed))
         let isStronglyShorter = finalWords.count < Int(Double(liveWords.count) * 0.7)
-        let isLowAgreement = overlap < 0.35
-        if isStronglyShorter && isLowAgreement {
+        let isModeratelyShorter = finalWords.count < Int(Double(liveWords.count) * 0.85)
+        let weakPrefixAlignment = sharedPrefix < min(4, finalWords.count)
+
+        // Reject regressive stop-time replacements that shrink too much,
+        // even if bag-of-words overlap is moderate.
+        if isStronglyShorter && overlap < 0.55 {
+            return liveTrimmed
+        }
+        if isModeratelyShorter && weakPrefixAlignment && overlap < 0.70 {
             return liveTrimmed
         }
 

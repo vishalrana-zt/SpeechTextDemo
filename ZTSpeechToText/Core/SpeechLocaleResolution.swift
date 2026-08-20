@@ -5,75 +5,89 @@
 //  Created by apple on 20/08/26.
 //
 
-
 import Foundation
 
 /// Shared locale-resolution logic used by both SpeechRecognizerTranscriptionEngine
 /// (legacy SFSpeechRecognizer) and SpeechAnalyzerTranscriptionEngine (iOS 26 SpeechAnalyzer),
-/// so region-preference behavior never drifts between the two engines.
+/// so locale behavior is consistent across engines.
 enum SpeechLocaleResolution {
 
-    /// Deterministic fallback order per language, used when the device's own
-    /// region isn't in the engine's supported-locale list. Ordered by
-    /// real-world on-device support / population, not arbitrary.
-    static let regionPriorityByLanguage: [String: [String]] = [
-        "en": ["en-US", "en-IN", "en-GB", "en-AU", "en-CA", "en-ZA", "en-SG", "en-IE", "en-NZ"],
-        "es": ["es-ES", "es-MX", "es-US", "es-AR", "es-CO", "es-CL"],
-        "fr": ["fr-FR", "fr-CA", "fr-CH", "fr-BE"]
-    ]
-
-    /// Resolves the best supported locale for a given language hint, preferring
-    /// (in order): exact hint match -> device's own region for that language ->
-    /// fixed priority list -> alphabetically-sorted first match for that language.
-    /// `supportedByIdentifier` must be keyed by lowercased locale identifier.
+    /// Resolves the best supported locale using a conservative, non-hardcoded policy:
+    /// exact hint match -> region-aware hint match -> same language (stable order) -> current locale -> first supported.
+    /// `supportedByIdentifier` may contain either `en-US` or `en_US`; matching is normalized.
     static func resolve(
         localeHint: Locale?,
         supportedByIdentifier: [String: Locale],
         allSupported: [Locale]
     ) -> Locale? {
-        if let localeHint {
-            let hintID = localeHint.identifier.lowercased()
+        let sortedSupported = allSupported.sorted {
+            normalizedIdentifier($0.identifier) < normalizedIdentifier($1.identifier)
+        }
 
-            if let exact = supportedByIdentifier[hintID] {
+        let normalizedSupportedByIdentifier = Dictionary(
+            supportedByIdentifier.values.map { (normalizedIdentifier($0.identifier), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        if let localeHint {
+            let hintID = normalizedIdentifier(localeHint.identifier)
+            let hintLanguage = localeHint.language.languageCode?.identifier.lowercased()
+            let hintHasRegion = hintID.contains("-")
+
+            if let exact = normalizedSupportedByIdentifier[hintID] {
                 return exact
             }
 
-            let languageCode = (localeHint.language.languageCode?.identifier ?? hintID).lowercased()
-
-            if let deviceRegion = Locale.current.region?.identifier {
-                let deviceLocaleID = "\(languageCode)-\(deviceRegion)".lowercased()
-                if let deviceMatch = supportedByIdentifier[deviceLocaleID] {
-                    return deviceMatch
-                }
+            // Prefix matching is only safe when the hint includes a region.
+            // For language-only hints like "en", prefix matching can pick arbitrary
+            // regions (en-AU/en-IN/...) depending on collection order.
+            if hintHasRegion,
+               let byPrefix = sortedSupported.first(where: { locale in
+                   let id = normalizedIdentifier(locale.identifier)
+                   return id.hasPrefix(hintID) || hintID.hasPrefix(id)
+               }) {
+                return byPrefix
             }
 
-            if let priorityList = regionPriorityByLanguage[languageCode] {
-                for identifier in priorityList {
-                    if let match = supportedByIdentifier[identifier.lowercased()] {
-                        return match
+            if let hintLanguage {
+                // Prefer current device region for the selected language when available.
+                if let region = Locale.current.region?.identifier.lowercased() {
+                    let currentRegionalID = normalizedIdentifier("\(hintLanguage)-\(region)")
+                    if let currentRegional = normalizedSupportedByIdentifier[currentRegionalID] {
+                        return currentRegional
                     }
                 }
-            }
 
-            let matches = allSupported
-                .filter { ($0.language.languageCode?.identifier ?? $0.identifier).lowercased() == languageCode }
-                .sorted { $0.identifier < $1.identifier }
-            if let match = matches.first {
-                return match
+                if let byLanguage = sortedSupported.first(where: {
+                    $0.language.languageCode?.identifier.lowercased() == hintLanguage
+                }) {
+                    return byLanguage
+                }
             }
         }
 
-        let sortedSupported = allSupported.sorted { $0.identifier < $1.identifier }
         let current = Locale.current
-        if let exact = sortedSupported.first(where: { $0.identifier == current.identifier }) {
+        let currentID = normalizedIdentifier(current.identifier)
+
+        if let exact = sortedSupported.first(where: {
+            normalizedIdentifier($0.identifier) == currentID
+        }) {
             return exact
         }
-        if let currentLanguage = current.language.languageCode?.identifier,
+
+        if let currentLanguage = current.language.languageCode?.identifier.lowercased(),
            let byLanguage = sortedSupported.first(where: {
-               $0.language.languageCode?.identifier == currentLanguage
+               $0.language.languageCode?.identifier.lowercased() == currentLanguage
            }) {
             return byLanguage
         }
+
         return sortedSupported.first
+    }
+
+    private static func normalizedIdentifier(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "_", with: "-")
+            .lowercased()
     }
 }

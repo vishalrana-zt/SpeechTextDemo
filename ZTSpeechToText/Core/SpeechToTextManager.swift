@@ -398,19 +398,27 @@ final class SpeechToTextManager: NSObject {
             defaults.set(true, forKey: Self.appleAdvancedQuarantinedKey)
             defaults.set(false, forKey: Self.appleAdvancedArmedKey)
         }
-#if DEBUG
+        // One-time drain of any locale reservations left over from before the
+        // reserve/release fix (or any other stale reservation), so each fresh
+        // app run starts at 0/5 instead of inheriting an already-exhausted quota.
+        if #available(iOS 26.0, *) {
+            Task(priority: .utility) {
+                for locale in await AssetInventory.reservedLocales {
+                    await AssetInventory.release(reservedLocale: locale)
+                }
+            }
+        }
+    #if DEBUG
         // Enable advanced Apple path testing by default on debug builds only.
         if defaults.object(forKey: Self.appleAdvancedExplicitOptInKey) == nil {
             defaults.set(true, forKey: Self.appleAdvancedExplicitOptInKey)
         }
 
-        // Developer convenience: automatically clear quarantine on launch in debug
-        // so each run can attempt advanced Apple path without manual reset calls.
         if defaults.bool(forKey: Self.appleAdvancedQuarantinedKey) {
             defaults.set(false, forKey: Self.appleAdvancedQuarantinedKey)
             defaults.set(false, forKey: Self.appleAdvancedArmedKey)
         }
-#endif
+    #endif
     }
 
     private func isAppleAdvancedPathQuarantined() -> Bool {
@@ -590,6 +598,37 @@ final class SpeechToTextManager: NSObject {
         modelState = modelState(for: mode)
         publishBackendStatus()
         debugLogRuntimeConfiguration(reason: "operation_mode_changed")
+    }
+
+    func resetSessionStateForLanguageChange(_ language: SupportedLanguage) {
+        cancelSpeechAnalyzerValidationTaskIfNeeded()
+        hasDisabledSpeechAnalyzerForSession = false
+        hasDisabledAdvancedLiveStreamForSession = false
+        hasValidatedSpeechAnalyzerForSession = false
+        loggedAppleGateFailures.removeAll()
+        advancedLiveStreamNoResultStreak = 0
+        setFinalizingTranscript(false)
+        setAppleLiveFinalText(nil)
+        resetLivePartialOutputState()
+        liveCaptureStartedAt = nil
+        activeCaptureSessionID = nil
+        lastSessionTranscribeCache = nil
+        sessionPreferredLanguageHint = language
+        liveLockedLanguage = language
+        pendingLiveLockLanguage = nil
+        pendingLiveLockConfirmations = 0
+        lastLiveResolvedLanguage = nil
+
+        appleLiveStateLock.lock()
+        lastNonEmptyLiveTranscriptText = nil
+        appleLiveStateLock.unlock()
+
+        Task(priority: .utility) { [liveDecodeCoordinator] in
+            await liveDecodeCoordinator.reset()
+        }
+
+        publishBackendStatus()
+        debugTrace("runtime reason=language_changed language=\(language.rawValue)")
     }
     
     // Safe to call again on relaunch if a previous download was interrupted —
@@ -1708,11 +1747,11 @@ final class SpeechToTextManager: NSObject {
             || message.contains("speech recognition")
             || message.contains("authorization")
             || message.contains("unsupported locale")
-            || message.contains("no supported speechanalyzer locale found") {
+            || message.contains("no supported speechanalyzer locale found")
+            || message.contains("too many allocated locales") {
             return true
         }
-        // Keep analyzer enabled for transient runtime failures
-        // (for example temporary locale/session allocation pressure).
+        // Keep analyzer enabled for transient runtime failures.
         return false
     }
 
@@ -1811,11 +1850,18 @@ final class SpeechToTextManager: NSObject {
         return Array(repeating: 0, count: sampleCount)
     }
 
+    // Prefer one stable regional locale per supported language to reduce
+    // analyzer locale churn; resolver will still fall back if unavailable.
     private func speechAnalyzerLocaleHint(for language: SupportedLanguage?) -> Locale? {
         guard let language else { return nil }
-        // Use a canonical language-only locale to avoid region churn (fr-FR/fr-CA/etc.)
-        // that can trigger Speech locale allocation limits.
-        return Locale(identifier: language.rawValue)
+        switch language {
+        case .english:
+            return Locale(identifier: "en-US")
+        case .spanish:
+            return Locale(identifier: "es-MX")
+        case .french:
+            return Locale(identifier: "fr-CA")
+        }
     }
 
     @available(iOS 26.0, *)
@@ -1828,7 +1874,7 @@ final class SpeechToTextManager: NSObject {
             supportedLocales.map { ($0.identifier.lowercased(), $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        let hint = Locale(identifier: language.rawValue)
+        let hint = speechAnalyzerLocaleHint(for: language) ?? Locale(identifier: language.rawValue)
         return SpeechLocaleResolution.resolve(
             localeHint: hint,
             supportedByIdentifier: supportedByIdentifier,
@@ -1995,6 +2041,12 @@ final class SpeechToTextManager: NSObject {
 
 @available(iOS 26.0, *)
 final class AppleLiveTranscriptionCoordinator {
+    deinit {
+        if let reservedLocale {
+            Task { await AssetInventory.release(reservedLocale: reservedLocale) }
+        }
+    }
+    
     enum EngineKind: String {
         case speechTranscriber
         case dictationTranscriber
@@ -2039,6 +2091,10 @@ final class AppleLiveTranscriptionCoordinator {
     private var hasLoggedFirstInputBuffer = false
 
     private var hasLoggedEngineSelection = false
+    /// Locale reserved for this coordinator's live session. Held for the
+    /// full session lifetime (not just asset install) and released in
+    /// stop(finalize:) or deinit.
+    private var reservedLocale: Locale?
 
     func start(localeHint: Locale?) async throws -> EngineSelection {
         let sessionID = UUID()
@@ -2066,6 +2122,12 @@ final class AppleLiveTranscriptionCoordinator {
             group.cancelAll()
             return result
         }
+        
+        // Reserve for the whole live session — install AND ongoing analysis —
+        // not just the install step. Released in stop(finalize:) / deinit.
+        try await AssetInventory.reserve(locale: resolved.locale)
+        reservedLocale = resolved.locale
+        
         let stream = AsyncStream<AnalyzerInput> { continuation in
             self.inputContinuation = continuation
         }
@@ -2078,6 +2140,8 @@ final class AppleLiveTranscriptionCoordinator {
                     reportingOptions: [.volatileResults, .fastResults],
                     attributeOptions: []
                 )
+                try await AssetInventory.reserve(locale: resolved.locale)
+
                 let transcriber = SpeechTranscriber(locale: resolved.locale, preset: preset)
                 try await ensureAssetsReady(module: transcriber)
 
@@ -2124,6 +2188,8 @@ final class AppleLiveTranscriptionCoordinator {
 
             case .dictationTranscriber:
                 let preset = DictationTranscriber.Preset.progressiveLongDictation
+                try await AssetInventory.reserve(locale: resolved.locale)
+
                 let transcriber = DictationTranscriber(locale: resolved.locale, preset: preset)
                 try await ensureAssetsReady(module: transcriber)
 
@@ -2282,6 +2348,10 @@ final class AppleLiveTranscriptionCoordinator {
             activeSessionID = nil
         }
         hasLoggedEngineSelection = false
+        if let reservedLocale {
+            await AssetInventory.release(reservedLocale: reservedLocale)
+            self.reservedLocale = nil
+        }
         transitionLifecycle(to: .idle, sessionID: sessionID, detail: "phase=stopped")
     }
 
