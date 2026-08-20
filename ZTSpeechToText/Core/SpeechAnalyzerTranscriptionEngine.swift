@@ -137,41 +137,18 @@ final class SpeechAnalyzerTranscriptionEngine {
         if supportedLocales.isEmpty {
             throw EngineError.unsupportedLocale
         }
-
-        // Avoid supportedLocale(equivalentTo:) due runtime traps seen on some
-        // iOS 26 builds. Resolve by identifier/language matching against the
-        // supported list so we never try reserving an unsupported locale id.
-        if let localeHint {
-            let hintID = localeHint.identifier.lowercased()
-            if let exact = supportedLocales.first(where: { $0.identifier.lowercased() == hintID }) {
-                return exact
-            }
-            if let byPrefix = supportedLocales.first(where: {
-                $0.identifier.lowercased().hasPrefix(hintID) || hintID.hasPrefix($0.identifier.lowercased())
-            }) {
-                return byPrefix
-            }
-            if let hintLanguage = localeHint.language.languageCode?.identifier.lowercased(),
-               let byLanguage = supportedLocales.first(where: {
-                   $0.language.languageCode?.identifier.lowercased() == hintLanguage
-               }) {
-                return byLanguage
-            }
+        let supportedByIdentifier = Dictionary(
+            supportedLocales.map { ($0.identifier.lowercased(), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        guard let resolved = SpeechLocaleResolution.resolve(
+            localeHint: localeHint,
+            supportedByIdentifier: supportedByIdentifier,
+            allSupported: supportedLocales
+        ) else {
+            throw EngineError.unsupportedLocale
         }
-
-        let current = Locale.current
-        if let exact = supportedLocales.first(where: { $0.identifier == current.identifier }) {
-            return exact
-        }
-
-        if let currentLanguage = current.language.languageCode?.identifier,
-           let byLanguage = supportedLocales.first(where: {
-               $0.language.languageCode?.identifier == currentLanguage
-           }) {
-            return byLanguage
-        }
-
-        return supportedLocales[0]
+        return resolved
     }
 
     private func ensureAssetsReady(for transcriber: SpeechTranscriber, locale: Locale) async throws {

@@ -201,29 +201,18 @@ final class SpeechRecognizerTranscriptionEngine {
 
     private func resolveLocale(localeHint: Locale?) throws -> Locale {
         let supported = SFSpeechRecognizer.supportedLocales()
-
-        if let localeHint {
-            if supported.contains(localeHint) { return localeHint }
-            if let match = supported.first(where: { $0.identifier.lowercased().hasPrefix(localeHint.identifier.lowercased()) }) {
-                return match
-            }
-            if let languageCode = localeHint.language.languageCode?.identifier.lowercased(),
-               let match = supported.first(where: { $0.identifier.lowercased().hasPrefix(languageCode) }) {
-                return match
-            }
+        let supportedByIdentifier = Dictionary(
+            supported.map { ($0.identifier.lowercased(), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        guard let resolved = SpeechLocaleResolution.resolve(
+            localeHint: localeHint,
+            supportedByIdentifier: supportedByIdentifier,
+            allSupported: Array(supported)
+        ) else {
+            throw EngineError.unsupportedLocale
         }
-
-        if let current = supported.first(where: { $0.identifier.lowercased() == Locale.current.identifier.lowercased() }) {
-            return current
-        }
-        if let preferredLanguage = Locale.preferredLanguages.first?.lowercased(),
-           let preferredMatch = supported.first(where: { preferredLanguage.hasPrefix($0.identifier.lowercased()) || $0.identifier.lowercased().hasPrefix(preferredLanguage.prefix(2)) }) {
-            return preferredMatch
-        }
-        if let first = supported.first {
-            return first
-        }
-        throw EngineError.unsupportedLocale
+        return resolved
     }
 
     private func writeAudioToTemporaryFile(audio: [Float], sampleRate: Double) throws -> URL {

@@ -314,12 +314,30 @@ final class SpeechToTextManager: NSObject {
         isAppleLiveSessionStarting = false
         appleLiveStateLock.unlock()
     }
+    
+    private var isDeviceEligibleForAdvancedAppleSpeech: Bool {
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let identifier = withUnsafeMutablePointer(to: &systemInfo.machine) { ptr -> String in
+            ptr.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+        }
+        // Exclude devices with A13 Bionic or older (e.g. iPad 9th Gen = iPad12,1 / iPad12,2)
+        // from the on-device SpeechAnalyzer/DictationTranscriber path.
+        let excludedPrefixes = ["iPad11,", "iPad12,", "iPad7,", "iPhone11,", "iPhone10,", "iPhone9,", "iPhone8,"]
+        return !excludedPrefixes.contains { identifier.hasPrefix($0) }
+    }
 
     private var useAdvancedAppleLiveTranscribers: Bool {
         guard #available(iOS 26.0, *) else {
             logAppleGateFailure("ios_version")
             return false
         }
+        
+        guard isDeviceEligibleForAdvancedAppleSpeech else {
+            logAppleGateFailure("device_hardware_ineligible")
+            return false
+        }
+        
         guard selectedModelProvider == .appleModels else {
             logAppleGateFailure("model_provider")
             return false
@@ -1321,6 +1339,7 @@ final class SpeechToTextManager: NSObject {
     
     private var canAttemptSpeechAnalyzer: Bool {
         guard selectedModelProvider == .appleModels else { return false }
+        guard isDeviceEligibleForAdvancedAppleSpeech else { return false }
         guard !hasDisabledSpeechAnalyzerForSession else { return false }
         guard #available(iOS 26.0, *) else { return false }
         guard !isAppleAdvancedPathQuarantined() else { return false }
@@ -1353,18 +1372,23 @@ final class SpeechToTextManager: NSObject {
 
         if isListening { stopListening() }
         let audio = try await finalAudioForTranscriptionAsync()
-        let localeHint = speechAnalyzerLocaleHint(for: effectiveSessionLanguage(preferredLanguage: preferredLanguage))
+        let languageHint = effectiveSessionLanguage(preferredLanguage: preferredLanguage)
+        let localeHint = speechAnalyzerLocaleHint(for: languageHint)
+        guard let analyzerLocale = await resolveSupportedSpeechAnalyzerLocale(for: languageHint) else {
+            debugTrace("speech_analyzer_final unsupported_locale language=\(languageHint.rawValue) preferred=\(localeHint?.identifier ?? "auto")")
+            throw SpeechAnalyzerTranscriptionEngine.EngineError.unsupportedLocale
+        }
         let engine = SpeechAnalyzerTranscriptionEngine()
         let audioSeconds = Double(audio.count) / targetSampleRate
         debugLogEngineSelection(
             phase: "speech_analyzer_final",
             engine: .speechAnalyzer,
-            detail: "preset=transcription localeHint=\(localeHint?.identifier ?? "auto") audio_s=\(String(format: "%.2f", audioSeconds))"
+            detail: "preset=transcription localeHint=\(analyzerLocale.identifier) audio_s=\(String(format: "%.2f", audioSeconds))"
         )
         let output = try await engine.transcribe(
             audio: audio,
             sampleRate: targetSampleRate,
-            localeHint: localeHint,
+            localeHint: analyzerLocale,
             preset: .transcription
         )
         let resolvedLanguage = supportedLanguage(from: output.locale, fallback: preferredLanguage)
@@ -1437,17 +1461,21 @@ final class SpeechToTextManager: NSObject {
         let windowEndTime = TimeInterval(fullAudio.count) / targetSampleRate
         let languageHint = effectiveSessionLanguage(preferredLanguage: preferredLanguage)
         let localeHint = speechAnalyzerLocaleHint(for: languageHint)
+        guard let analyzerLocale = await resolveSupportedSpeechAnalyzerLocale(for: languageHint) else {
+            debugTrace("speech_analyzer_partial unsupported_locale language=\(languageHint.rawValue) preferred=\(localeHint?.identifier ?? "auto")")
+            throw SpeechAnalyzerTranscriptionEngine.EngineError.unsupportedLocale
+        }
         let engine = SpeechAnalyzerTranscriptionEngine()
         let audioSeconds = Double(audioWindow.count) / targetSampleRate
         debugLogEngineSelection(
             phase: "speech_analyzer_partial",
             engine: .speechAnalyzer,
-            detail: "preset=progressiveTranscription localeHint=\(localeHint?.identifier ?? "auto") window_s=\(String(format: "%.2f", audioSeconds))"
+            detail: "preset=progressiveTranscription localeHint=\(analyzerLocale.identifier) window_s=\(String(format: "%.2f", audioSeconds))"
         )
         let output = try await engine.transcribe(
             audio: audioWindow,
             sampleRate: targetSampleRate,
-            localeHint: localeHint,
+            localeHint: analyzerLocale,
             preset: .progressiveTranscription
         )
 
@@ -1668,13 +1696,19 @@ final class SpeechToTextManager: NSObject {
 
     private func shouldDisableSpeechAnalyzer(for error: Error) -> Bool {
         if error is CancellationError { return false }
+        if #available(iOS 26.0, *),
+           let engineError = error as? SpeechAnalyzerTranscriptionEngine.EngineError,
+           case .unsupportedLocale = engineError {
+            return true
+        }
         let message = error.localizedDescription.lowercased()
         if message.contains("not subscribed to transcription")
             || message.contains("cannot check the download status")
             || message.contains("asset")
             || message.contains("speech recognition")
             || message.contains("authorization")
-            || message.contains("unsupported locale") {
+            || message.contains("unsupported locale")
+            || message.contains("no supported speechanalyzer locale found") {
             return true
         }
         // Keep analyzer enabled for transient runtime failures
@@ -1784,12 +1818,31 @@ final class SpeechToTextManager: NSObject {
         return Locale(identifier: language.rawValue)
     }
 
+    @available(iOS 26.0, *)
+    private func resolveSupportedSpeechAnalyzerLocale(for language: SupportedLanguage) async -> Locale? {
+        guard SpeechTranscriber.isAvailable else { return nil }
+        let supportedLocales = await SpeechTranscriber.supportedLocales
+        guard !supportedLocales.isEmpty else { return nil }
+
+        let supportedByIdentifier = Dictionary(
+            supportedLocales.map { ($0.identifier.lowercased(), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let hint = Locale(identifier: language.rawValue)
+        return SpeechLocaleResolution.resolve(
+            localeHint: hint,
+            supportedByIdentifier: supportedByIdentifier,
+            allSupported: supportedLocales
+        )
+    }
+
     private func supportedLanguage(from locale: Locale, fallback: SupportedLanguage?) -> SupportedLanguage {
-        let identifier = locale.identifier.lowercased()
-        if identifier.hasPrefix("en") { return .english }
-        if identifier.hasPrefix("es") { return .spanish }
-        if identifier.hasPrefix("fr") { return .french }
-        return fallback ?? preferredDeviceSupportedLanguage() ?? .english
+        switch locale.language.languageCode?.identifier {
+        case "en": return .english
+        case "es": return .spanish
+        case "fr": return .french
+        default: return fallback ?? preferredDeviceSupportedLanguage() ?? .english
+        }
     }
 
     private func effectiveSessionLanguage(preferredLanguage: SupportedLanguage?) -> SupportedLanguage {
@@ -1997,7 +2050,22 @@ final class AppleLiveTranscriptionCoordinator {
         resetTranscriptState()
         hasLoggedFirstInputBuffer = false
 
-        let resolved = try await resolveEngine(localeHint: localeHint, sessionID: sessionID)
+        let resolved = try await withThrowingTaskGroup(of: EngineSelection.self) { group in
+            group.addTask { try await self.resolveEngine(localeHint: localeHint, sessionID: sessionID) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                throw NSError(
+                    domain: "AppleLiveTranscriptionCoordinator",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Engine resolution timed out"]
+                )
+            }
+            guard let result = try await group.next() else {
+                throw NSError(domain: "AppleLiveTranscriptionCoordinator", code: 4, userInfo: [NSLocalizedDescriptionKey: "Engine resolution produced no result"])
+            }
+            group.cancelAll()
+            return result
+        }
         let stream = AsyncStream<AnalyzerInput> { continuation in
             self.inputContinuation = continuation
         }
