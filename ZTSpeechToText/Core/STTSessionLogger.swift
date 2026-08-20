@@ -91,6 +91,17 @@ final class STTSessionLogger {
         }
     }
 
+    func clearAllLogs() {
+        queue.sync {
+            let files = (try? FileManager.default.contentsOfDirectory(at: logsDirectoryURL, includingPropertiesForKeys: nil)) ?? []
+            for fileURL in files {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+            FileManager.default.createFile(atPath: currentLogFileURL.path, contents: nil)
+            writeLine("[STT][logger] clear_all")
+        }
+    }
+
     private func writeLine(_ line: String) {
         let ts = isoFormatter.string(from: Date())
         let fullLine = "\(ts) \(line)\n"

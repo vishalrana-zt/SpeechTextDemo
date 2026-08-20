@@ -7,7 +7,8 @@ struct SpeechRecognizerTranscriptionOutput {
     let locale: Locale
 }
 
-final class SpeechRecognizerTranscriptionEngine {
+final class SpeechRecognizerTranscriptionEngine: FinalTranscriptionEngine {
+    let engineID = "speechRecognizer"
     enum EngineError: LocalizedError {
         case authorizationDenied
         case unavailableRecognizer
@@ -62,22 +63,79 @@ final class SpeechRecognizerTranscriptionEngine {
         let maxAttempts = (timeoutInterval == nil) ? 3 : 2
         var attempt = 0
         while true {
+            let currentAttempt = attempt + 1
             do {
-                return try await transcribeOnce(
+                let result = try await transcribeOnce(
                     recognizer: recognizer,
                     fileURL: fileURL,
                     locale: locale,
                     timeoutInterval: timeoutInterval
                 )
+                if currentAttempt > 1 {
+                    STTSessionLogger.shared.log(
+                        source: "SpeechRecognizerEngine",
+                        message: "retry_result attempt=\(currentAttempt) result=success chars=\(result.text.count)"
+                    )
+                }
+                return result
             } catch {
                 attempt += 1
-                guard attempt < maxAttempts, shouldRetryRecognition(error) else {
+                let retryable = shouldRetryRecognition(error)
+                let nsError = error as NSError
+                STTSessionLogger.shared.log(
+                    source: "SpeechRecognizerEngine",
+                    message: "engine_error attempt=\(currentAttempt) domain=\(nsError.domain) code=\(nsError.code) retryable=\(retryable) reason=\(error.localizedDescription)"
+                )
+                guard attempt < maxAttempts, retryable else {
+                    if currentAttempt > 1 {
+                        STTSessionLogger.shared.log(
+                            source: "SpeechRecognizerEngine",
+                            message: "retry_result attempt=\(currentAttempt) result=failure"
+                        )
+                    }
                     throw error
                 }
+                STTSessionLogger.shared.log(
+                    source: "SpeechRecognizerEngine",
+                    message: "retry_start attempt=\(attempt + 1) max_attempts=\(maxAttempts) reason=\(error.localizedDescription)"
+                )
                 try? await Task.sleep(nanoseconds: 450_000_000)
             }
         }
 #endif
+    }
+
+    func transcribe(_ request: TranscriptionRequest) async throws -> TranscriptionResult {
+        do {
+            let output = try await transcribe(
+                audio: request.audio,
+                sampleRate: request.sampleRate,
+                localeHint: request.localeHint,
+                timeoutInterval: request.timeoutInterval
+            )
+            return TranscriptionResult(text: output.text, locale: output.locale)
+        } catch let error as EngineError {
+            switch error {
+            case .authorizationDenied:
+                throw TranscriptionEngineError.authorizationDenied
+            case .unavailableRecognizer:
+                throw TranscriptionEngineError.engineUnavailable
+            case .unsupportedLocale:
+                throw TranscriptionEngineError.unsupportedLocale
+            case .emptyAudio:
+                throw TranscriptionEngineError.emptyAudio
+            case .noRecognitionResult:
+                throw TranscriptionEngineError.noFinalText
+            case .simulatorNotSupported:
+                throw TranscriptionEngineError.engineUnavailable
+            }
+        } catch {
+            let nsError = error as NSError
+            if nsError.code == -1001 {
+                throw TranscriptionEngineError.timeout
+            }
+            throw TranscriptionEngineError.transcriptionFailed(underlying: error)
+        }
     }
 
     private func transcribeOnce(
@@ -89,9 +147,7 @@ final class SpeechRecognizerTranscriptionEngine {
         let request = SFSpeechURLRecognitionRequest(url: fileURL)
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        // Reliability-first default: do not force on-device mode.
         request.addsPunctuation = true
 
         return try await withCheckedThrowingContinuation { continuation in

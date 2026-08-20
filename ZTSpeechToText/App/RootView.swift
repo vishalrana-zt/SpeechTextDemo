@@ -191,13 +191,9 @@ struct RootView: View {
             }
         }
         .confirmationDialog("Log Actions", isPresented: $isLogActionsPresented, titleVisibility: .visible) {
-            Button("Clear Logs") {
-                STTSessionLogger.shared.clearCurrentLog()
-                STTSessionLogger.shared.log(source: "RootView", message: "ui action=clear_logs")
-            }
-            Button("Clear Previous Logs") {
-                STTSessionLogger.shared.clearPreviousLogs()
-                STTSessionLogger.shared.log(source: "RootView", message: "ui action=clear_previous_logs")
+            Button("Clear All Logs") {
+                STTSessionLogger.shared.clearAllLogs()
+                STTSessionLogger.shared.log(source: "RootView", message: "ui action=clear_all_logs")
             }
             Button("Share Logs") {
                 let text = STTSessionLogger.shared.shareableLogText()
