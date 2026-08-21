@@ -124,14 +124,15 @@ struct RootView: View {
             .navigationTitle("Notes")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        isLogActionsPresented = true
-                    } label: {
-                        Image(systemName: "doc.text")
-                    }
-                    .accessibilityLabel("Log Actions")
-                    
-                    Button {
+                    HStack {
+                        Button {
+                            isLogActionsPresented = true
+                        } label: {
+                            Image(systemName: "doc.text")
+                        }
+                        .accessibilityLabel("Log Actions")
+
+                        Button {
                             isTextAISheetPresented = true
                         } label: {
                             Image(systemName: "character.textbox")

@@ -5,7 +5,7 @@ import UIKit
 struct TextAIPrototypeView: View {
     @Environment(\.dismiss) private var dismiss
     private let service = TextAIService(
-        resolver: TextAIProviderResolver(forceBundledLocalLLMForTesting: true)
+        resolver: TextAIProviderResolver(forceBundledLocalLLMForTesting: false)
     )
 
     @State private var inputText = "i went to the office yesterday and i did not finish my work because the meeting was too long."
