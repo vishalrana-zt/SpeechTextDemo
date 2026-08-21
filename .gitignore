@@ -18,3 +18,6 @@ xcuserdata/
 /ZTSpeechToText/Resource/openai_whisper-small
 /ZTSpeechToText/Resource/openai_whisper-tiny
 /ZTSpeechToText/Resource
+
+# Local bundled LLM weights
+*.gguf

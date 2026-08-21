@@ -6,27 +6,12 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXContainerItemProxy section */
-		18C9A6A3302B11B100205C88 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 18C9A68D302B11B000205C88 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 18C9A694302B11B000205C88;
-			remoteInfo = ZTSpeechToText;
-		};
-		18C9A6AD302B11B100205C88 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 18C9A68D302B11B000205C88 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 18C9A694302B11B000205C88;
-			remoteInfo = ZTSpeechToText;
-		};
-/* End PBXContainerItemProxy section */
+/* Begin PBXBuildFile section */
+		180D93093035C01C007CA704 /* LlamaSPM in Frameworks */ = {isa = PBXBuildFile; productRef = 180D93083035C01C007CA704 /* LlamaSPM */; };
+/* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		18C9A695302B11B000205C88 /* ZTSpeechToText.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZTSpeechToText.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		18C9A6A2302B11B100205C88 /* ZTSpeechToTextTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ZTSpeechToTextTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		18C9A6AC302B11B100205C88 /* ZTSpeechToTextUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ZTSpeechToTextUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -42,20 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		18C9A69F302B11B100205C88 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		18C9A6A9302B11B100205C88 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
+				180D93093035C01C007CA704 /* LlamaSPM in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -74,8 +46,6 @@
 			isa = PBXGroup;
 			children = (
 				18C9A695302B11B000205C88 /* ZTSpeechToText.app */,
-				18C9A6A2302B11B100205C88 /* ZTSpeechToTextTests.xctest */,
-				18C9A6AC302B11B100205C88 /* ZTSpeechToTextUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -100,51 +70,13 @@
 			);
 			name = ZTSpeechToText;
 			packageProductDependencies = (
+				180D93083035C01C007CA704 /* LlamaSPM */,
 			);
 			productName = ZTSpeechToText;
 			productReference = 18C9A695302B11B000205C88 /* ZTSpeechToText.app */;
 			productType = "com.apple.product-type.application";
 		};
-		18C9A6A1302B11B100205C88 /* ZTSpeechToTextTests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 18C9A6B9302B11B100205C88 /* Build configuration list for PBXNativeTarget "ZTSpeechToTextTests" */;
-			buildPhases = (
-				18C9A69E302B11B100205C88 /* Sources */,
-				18C9A69F302B11B100205C88 /* Frameworks */,
-				18C9A6A0302B11B100205C88 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				18C9A6A4302B11B100205C88 /* PBXTargetDependency */,
-			);
-			name = ZTSpeechToTextTests;
-			packageProductDependencies = (
-			);
-			productName = ZTSpeechToTextTests;
-			productReference = 18C9A6A2302B11B100205C88 /* ZTSpeechToTextTests.xctest */;
-			productType = "com.apple.product-type.bundle.unit-test";
-		};
-		18C9A6AB302B11B100205C88 /* ZTSpeechToTextUITests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 18C9A6BC302B11B100205C88 /* Build configuration list for PBXNativeTarget "ZTSpeechToTextUITests" */;
-			buildPhases = (
-				18C9A6A8302B11B100205C88 /* Sources */,
-				18C9A6A9302B11B100205C88 /* Frameworks */,
-				18C9A6AA302B11B100205C88 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				18C9A6AE302B11B100205C88 /* PBXTargetDependency */,
-			);
-			name = ZTSpeechToTextUITests;
-			packageProductDependencies = (
-			);
-			productName = ZTSpeechToTextUITests;
-			productReference = 18C9A6AC302B11B100205C88 /* ZTSpeechToTextUITests.xctest */;
-			productType = "com.apple.product-type.bundle.ui-testing";
-		};
+
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -158,14 +90,6 @@
 					18C9A694302B11B000205C88 = {
 						CreatedOnToolsVersion = 26.6;
 					};
-					18C9A6A1302B11B100205C88 = {
-						CreatedOnToolsVersion = 26.6;
-						TestTargetID = 18C9A694302B11B000205C88;
-					};
-					18C9A6AB302B11B100205C88 = {
-						CreatedOnToolsVersion = 26.6;
-						TestTargetID = 18C9A694302B11B000205C88;
-					};
 				};
 			};
 			buildConfigurationList = 18C9A690302B11B000205C88 /* Build configuration list for PBXProject "ZTSpeechToText" */;
@@ -178,6 +102,7 @@
 			mainGroup = 18C9A68C302B11B000205C88;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				180D93073035C01C007CA704 /* XCLocalSwiftPackageReference "LlamaSPM" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 18C9A696302B11B000205C88 /* Products */;
@@ -185,28 +110,12 @@
 			projectRoot = "";
 			targets = (
 				18C9A694302B11B000205C88 /* ZTSpeechToText */,
-				18C9A6A1302B11B100205C88 /* ZTSpeechToTextTests */,
-				18C9A6AB302B11B100205C88 /* ZTSpeechToTextUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		18C9A693302B11B000205C88 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		18C9A6A0302B11B100205C88 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		18C9A6AA302B11B100205C88 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -223,34 +132,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		18C9A69E302B11B100205C88 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		18C9A6A8302B11B100205C88 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXSourcesBuildPhase section */
-
-/* Begin PBXTargetDependency section */
-		18C9A6A4302B11B100205C88 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = 18C9A694302B11B000205C88 /* ZTSpeechToText */;
-			targetProxy = 18C9A6A3302B11B100205C88 /* PBXContainerItemProxy */;
-		};
-		18C9A6AE302B11B100205C88 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = 18C9A694302B11B000205C88 /* ZTSpeechToText */;
-			targetProxy = 18C9A6AD302B11B100205C88 /* PBXContainerItemProxy */;
-		};
-/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		18C9A6B4302B11B100205C88 /* Debug */ = {
@@ -444,90 +326,6 @@
 			};
 			name = Release;
 		};
-		18C9A6BA302B11B100205C88 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = TS3BFX5G72;
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vishalrana.ZTSpeechToTextTests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ZTSpeechToText.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ZTSpeechToText";
-			};
-			name = Debug;
-		};
-		18C9A6BB302B11B100205C88 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = TS3BFX5G72;
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vishalrana.ZTSpeechToTextTests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ZTSpeechToText.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ZTSpeechToText";
-			};
-			name = Release;
-		};
-		18C9A6BD302B11B100205C88 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = TS3BFX5G72;
-				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vishalrana.ZTSpeechToTextUITests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = ZTSpeechToText;
-			};
-			name = Debug;
-		};
-		18C9A6BE302B11B100205C88 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = TS3BFX5G72;
-				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vishalrana.ZTSpeechToTextUITests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = ZTSpeechToText;
-			};
-			name = Release;
-		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -549,25 +347,21 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		18C9A6B9302B11B100205C88 /* Build configuration list for PBXNativeTarget "ZTSpeechToTextTests" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				18C9A6BA302B11B100205C88 /* Debug */,
-				18C9A6BB302B11B100205C88 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
-		18C9A6BC302B11B100205C88 /* Build configuration list for PBXNativeTarget "ZTSpeechToTextUITests" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				18C9A6BD302B11B100205C88 /* Debug */,
-				18C9A6BE302B11B100205C88 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		180D93073035C01C007CA704 /* XCLocalSwiftPackageReference "LlamaSPM" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = LlamaSPM;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		180D93083035C01C007CA704 /* LlamaSPM */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = LlamaSPM;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 18C9A68D302B11B000205C88 /* Project object */;
 }

@@ -48,6 +48,7 @@ struct RootView: View {
     @State private var isLogActionsPresented = false
     @State private var isLogSharePresented = false
     @State private var logShareText: String?
+    @State private var isTextAISheetPresented = false
     private let bottomPanelReservedHeight: CGFloat = 60
     private let invalidTranscriptMarkers: [String] = [
         "SwiftUI.ModifiedContent<",
@@ -129,7 +130,16 @@ struct RootView: View {
                         Image(systemName: "doc.text")
                     }
                     .accessibilityLabel("Log Actions")
+                    
+                    Button {
+                            isTextAISheetPresented = true
+                        } label: {
+                            Image(systemName: "character.textbox")
+                        }
+                        .accessibilityLabel("Open offline text AI")
+                    }
                 }
+
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         STTSessionLogger.shared.log(
@@ -202,6 +212,9 @@ struct RootView: View {
                 STTSessionLogger.shared.log(source: "RootView", message: "ui action=share_logs text_chars=\(text.count)")
             }
             Button("Cancel", role: .cancel) {}
+        }
+        .fullScreenCover(isPresented: $isTextAISheetPresented) {
+            TextAIPrototypeView()
         }
     }
 
