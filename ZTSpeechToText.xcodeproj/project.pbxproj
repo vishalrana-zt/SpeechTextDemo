@@ -34,23 +34,9 @@
 		18C9A6AC302B11B100205C88 /* ZTSpeechToTextUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ZTSpeechToTextUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
-/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		18DB0E5C302EF00D00A5F2CA /* Exceptions for "ZTSpeechToText" folder in "ZTSpeechToText" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				"Resource/openai_whisper-small.bundle",
-				"Resource/openai_whisper-tiny.bundle",
-			);
-			target = 18C9A694302B11B000205C88 /* ZTSpeechToText */;
-		};
-/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
-
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		18C9A697302B11B000205C88 /* ZTSpeechToText */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				18DB0E5C302EF00D00A5F2CA /* Exceptions for "ZTSpeechToText" folder in "ZTSpeechToText" target */,
-			);
 			path = ZTSpeechToText;
 			sourceTree = "<group>";
 		};

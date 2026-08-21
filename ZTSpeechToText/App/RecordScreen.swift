@@ -280,7 +280,7 @@ struct RecordScreen: View {
         if isListening || isTranscribing {
             return Text(statusText)
         }
-        return Text("Tap \(Text("Speak now").foregroundStyle(Color.accentColor).fontWeight(.bold)) to start recording")
+        return Text("Tap Speak now to start recording")
     }
 
     private var formattedRecordingDuration: String {
